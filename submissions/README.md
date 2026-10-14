@@ -1,34 +1,53 @@
 # 提交说明 (BigQuant 量化大赛 · 端到端赛道)
 
-本目录是可直接上传平台的**完整模型包**。平台要求**单层目录**, 因此每个 `cnn_*`
-子目录内只放文件、不嵌套子目录:
+## 直接上传的压缩包
+
+平台要求 **压缩包内有且只有一个 notebook**。本目录下三个 `.zip` 即为可直接上传的
+提交物:
+
+| 压缩包 | 模型 | 频率 | 参数量 | val_IC | 2024H2 test_IC |
+|---|---|---|---|---|---|
+| `cnn_1f_bar30m.zip` | CNN+Transformer 单频 | bar30m | 187K | +0.0473 | +0.0541 |
+| `cnn_2f.zip` | CNN+Transformer 双频 | bar30m+bar5m | 395K | +0.0746 | +0.0813 |
+| `cnn_3f.zip` | CNN+Transformer 三频 | bar30m+bar15m+bar5m | 590K | +0.0782 | +0.0842 |
+
+每个 zip 内**恰好 1 个 notebook** + 附属文件 (平铺, 无子目录):
 
 ```
-<提交目录>/
-  Transformer_modelsave_train.py     # 训练脚本 (数据 + 模型 + 训练循环, 单一事实来源)
-  Transformer_modelsave_predict.py   # 推理脚本 (notebook 入口, main(datasources, start_date, end_date))
+<包名>.zip/
+  Transformer_modelsave_predict.ipynb   # 唯一的 notebook (含 main, 自包含全部代码)
+  transformer_model.json                # 已训练模型权重
+  requirements.txt                      # 依赖声明
+```
+
+> 建议优先提交 **`cnn_3f.zip`** (IC 最高) 与 **`cnn_2f.zip`** (性价比最高, 参数少 33%)。
+
+## 平台要求 ↔ 对应内容
+
+| 平台要求 | 位置 |
+|---|---|
+| **有且仅有一个 Notebook** | `Transformer_modelsave_predict.ipynb` |
+| **可调用的 `main(datasources, start_date, end_date)`** | 该 notebook 中 (从 `datasources` 取表, 不硬编码物理表名) |
+| **训练脚本** | 内联进 notebook (数据管线 + 模型定义 + `train_and_save`) |
+| **推理脚本** | 内联进 notebook (`main`) |
+| **依赖声明** | `requirements.txt` (zip 内) |
+| **超参数配置** | notebook 第 2 个代码单元格 (`CFG` = 原 `config.py` 全部内容) |
+| **随机种子** | 同 `CFG.SEED = 42`; 训练脚本固定 Python/NumPy/PyTorch/CUDA 种子; 权重 json 亦含 `seed` |
+| **已训练模型权重** | `transformer_model.json` (zip 内) |
+
+## 源文件 (构建输入, 不直接上传)
+
+每个 `cnn_*` 目录保留可读源文件, 由 `_tools/build_notebook.py` 打包成 notebook:
+
+```
+<包名>/
+  Transformer_modelsave_train.py     # 训练脚本 (数据 + 模型 + 训练循环)
+  Transformer_modelsave_predict.py   # 推理脚本 (main 的原型)
   config.py                          # 超参数配置 + 随机种子
   requirements.txt                   # 依赖声明
-  transformer_model.json             # 已训练模型权重 (+ 标准化统计 + 结构超参)
+  transformer_model.json             # 已训练模型权重
+  Transformer_modelsave_predict.ipynb  # 由上述源文件生成的单 notebook 提交物
 ```
-
-## 提交清单对照 (平台要求 ↔ 本包)
-
-| 平台要求 | 对应文件 |
-|---|---|
-| 训练脚本 | `Transformer_modelsave_train.py` |
-| 推理脚本 | `Transformer_modelsave_predict.py` |
-| 依赖声明 | `requirements.txt` |
-| 超参数配置 | `config.py` (`MODEL_CFG` / `TRAIN_CFG`) |
-| 随机种子 | `config.py` (`SEED`), 训练脚本中固定 Python/NumPy/PyTorch 种子; 并写入 `transformer_model.json` 的 `seed` 字段 |
-| 已训练模型权重 | `transformer_model.json` |
-
-上传时把**该目录内的全部文件**一起提交 (平铺, 不要带子目录)。
-
-## 目录一览
-
-| 子目录 | 模型 | 频率 | 参数量 | val_IC | 2024H2 test_IC |
-|---|---|---|---|---|---|
 | `cnn_1f_bar30m` | CNN+Transformer 单频 | bar30m | 187K | +0.0473 | +0.0541 |
 | `cnn_2f` | CNN+Transformer 双频 | bar30m+bar5m | 395K | +0.0746 | +0.0813 |
 | `cnn_3f` | CNN+Transformer 三频 | bar30m+bar15m+bar5m | 590K | +0.0782 | +0.0842 |
@@ -59,13 +78,11 @@
 
 ## 复现方式
 
-- **本地训练** (生成权重):
-  ```bash
-  python Transformer_modelsave_train.py     # 训练区间由 config.TRAIN_MONTHS 决定
-  ```
+- **本地训练** (生成权重): 运行 notebook 内的 `train_and_save(datasources)`,
+  训练区间由 `CFG.TRAIN_MONTHS` 决定。
 - **公榜**: 平台只替换 `datasources / start_date / end_date` 并调用 `main`, 仅用提交的
-  `transformer_model.json` 推理。
-- **私榜**: 平台调用 `train_and_save(datasources)` 在隔离环境从零重训 (种子固定),
+  `transformer_model.json` 推理 (不重训)。
+- **私榜**: 平台调用 `train_and_save(datasources)` 在隔离环境从零重训 (种子已固定),
   用于合规性验证。
 
 ## 约束提醒
@@ -73,9 +90,12 @@
 - 因子值越大越好 (模型输出已按此方向训练)。
 - 不能缺失分钟, 每个截面缺失率需 ≤ 40%。
 - 输出经 `cpt_jyc_2026_instruments` 对齐, 保证时间戳/截面合法。
+- 总运行时间 ≤ 3 小时; 评测环境无法访问外部网络。
 
-## 本地构建工具 (不提交, 位于 `../_tools/`)
+## 本地构建/验证工具 (不提交, 位于 `_tools/`)
 
 - `convert_checkpoints.py` — 把 `miniquant/checkpoints/*.pt` 转成各目录的
   `transformer_model.json` (含 seed / 超参元数据)。
+- `build_notebook.py` — 把每个包的源文件打包成**单个 notebook** 并生成上传 zip。
+- `verify_notebook.py` — 顺序执行 notebook 全部单元格并调用 `main()`, 验证输出格式。
 - `verify_submission.py` — 用提交侧代码走完整推理链路, 在本地 feather 上复算 2024H2 IC 对拍。

@@ -179,6 +179,9 @@ class StockTransformer(nn.Module):
             nn.ReLU(), nn.Dropout(dropout), nn.Linear(fused_dim, 1))
 
     def forward(self, x):
+        # 兼容主入口统一传入 list(多频分支); 单频取第 0 项
+        if isinstance(x, (list, tuple)):
+            x = x[0]
         return self.head(self.pool(self.encoder(x))).squeeze(-1)
 
 
