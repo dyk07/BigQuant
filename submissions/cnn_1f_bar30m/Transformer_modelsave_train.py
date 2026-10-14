@@ -223,12 +223,15 @@ def build_model(model_cfg):
 # ==========================================================================
 # 数据: 读表 -> 还原 -> 重采样 -> 特征 -> 切窗
 # ==========================================================================
-def _to_dataframe(table):
+def _fetch_table(table, start, end):
     """
-    把 datasources 里的表对象统一成 pandas DataFrame。
+    取数据为 DataFrame。
 
-    平台注入口径未知, 这里兼容常见形式: DataFrame / .to_pandas() / .to_df() /
-    .df() / 表名字符串(走 dai.query)。列名已在 _normalize 里做归一。
+    - DataFrame: 直接使用;
+    - 平台表对象: 经 to_pandas()/to_df()/df() 取出;
+    - 表名(str/可 f-string 化): 走 dai.query, **必须带日期过滤**
+      (平台会提供约 1 年前置数据, 不加过滤会把整表读入内存 -> OOM/超时)。
+      额外向前多取 10 天, 保证 start 当日的输入窗口能回看到历史 bar。
     """
     if isinstance(table, pd.DataFrame):
         return table
@@ -239,10 +242,17 @@ def _to_dataframe(table):
     if hasattr(table, "df"):
         obj = table.df
         return obj() if callable(obj) else obj
-    if isinstance(table, str):
-        import dai
-        return dai.query(f"SELECT * FROM {table}").df()
-    raise TypeError(f"无法识别的数据表类型: {type(table)}")
+    # 表名: 用 dai 查询并只取 [start - 10 天, end]
+    import dai
+    buf = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    end_s = pd.Timestamp(end).strftime("%Y-%m-%d %H:%M:%S")
+    return dai.query(f"SELECT * FROM {table}",
+                     filters={"date": [buf, end_s]}).df()
+
+
+# 向后兼容别名(旧调用名)
+def _to_dataframe(table, start=None, end=None):
+    return _fetch_table(table, start, end)
 
 
 def _normalize(df):
@@ -496,7 +506,7 @@ def build_dataset(table, start_date, end_date, mode, minutes, stats,
     if minutes is None:
         minutes = ALIGNED_MINUTES
 
-    df = _normalize(_to_dataframe(table))
+    df = _normalize(_fetch_table(table, start_date, end_date))
     df = restore_units(df)
     df = tag_time(df)
 
@@ -600,13 +610,20 @@ def load_model(path, map_location="cpu"):
 # ==========================================================================
 def _load_range(table, months_or_start, end=None):
     """按月份列表或日期区间读 1 分钟表, 返回还原+打标后的 DataFrame。"""
-    df = _normalize(_to_dataframe(table))
-    df = restore_units(df)
     if end is None:
-        months = months_or_start
-        mask = df["date"].dt.strftime("%Y%m").isin([str(m) for m in months])
+        months = [str(m) for m in months_or_start]
+        # 取月份列表覆盖的日期范围, 只查询该区间(避免整表读入内存)
+        start_s = f"{months[0][:4]}-{months[0][4:6]}-01"
+        last = months[-1]
+        end_s = (pd.Timestamp(f"{last[:4]}-{last[4:6]}-01")
+                 + pd.offsets.MonthEnd(1)).strftime("%Y-%m-%d 23:59:59")
+        df = _normalize(_fetch_table(table, start_s, end_s))
+        df = restore_units(df)
+        mask = df["date"].dt.strftime("%Y%m").isin(months)
         df = df[mask]
     else:
+        df = _normalize(_fetch_table(table, months_or_start, end))
+        df = restore_units(df)
         df = df[(df["date"] >= pd.Timestamp(months_or_start))
                 & (df["date"] <= pd.Timestamp(end))]
     return tag_time(df)

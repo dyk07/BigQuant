@@ -1,15 +1,14 @@
 #!/usr/bin/env python
 """
-把提交目录里的 .py 源码打成**单个 notebook** (.ipynb), 并生成上传用 zip。
+把提交目录里的 .py 源码打包成**单个 notebook** (.ipynb), 保留原始文件夹 (不生成 zip)。
 
 - 训练脚本 + 推理脚本 + 超参数配置 + 随机种子 全部内联进 notebook;
-- 依赖声明 (requirements.txt) 与权重 (transformer_model.json) 作为 zip 内附属文件;
-- zip 内**有且只有一个 notebook**。
+- 依赖声明 (requirements.txt) 与权重 (transformer_model.json) 作为同目录附属文件;
+- 每个提交包内**有且只有一个 notebook** (平台要求)。
 """
 import json
 import os
 import re
-import zipfile
 
 ROOT = "/mnt/c/Users/Kelvin/Documents/GitHub/BigQuant"
 SUB = os.path.join(ROOT, "submissions")
@@ -168,22 +167,12 @@ def main():
             json.dump(nb, fh, ensure_ascii=False, indent=1)
         print(f"[notebook] {pkg}/{NOTEBOOK_NAME}  cells={len(nb['cells'])}")
 
-        zip_path = os.path.join(SUB, f"{pkg}.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(nb_path, NOTEBOOK_NAME)
-            # 训练脚本 / 超参配置作为附属 .py 一并提交 (私榜重训会导入 train_and_save)
-            zf.write(os.path.join(pkg_dir, "Transformer_modelsave_train.py"),
-                     "Transformer_modelsave_train.py")
-            zf.write(os.path.join(pkg_dir, "config.py"), "config.py")
-            zf.write(os.path.join(pkg_dir, "transformer_model.json"),
-                     "transformer_model.json")
-            zf.write(os.path.join(pkg_dir, "requirements.txt"), "requirements.txt")
-        with zipfile.ZipFile(zip_path) as zf:
-            names = zf.namelist()
-        n_nb = sum(n.endswith(".ipynb") for n in names)
+        # 检查包内**有且只有一个 notebook** (平台要求)
+        n_nb = sum(fn.endswith(".ipynb") for fn in os.listdir(pkg_dir))
         assert n_nb == 1, f"{pkg}: notebook 数量 = {n_nb} (必须为 1)"
-        assert not any("/" in n for n in names), f"{pkg}: zip 内不应有子目录"
-        print(f"[zip]      {pkg}.zip  ({n_nb} notebook) -> {names}")
+        # 列出包内全部文件 (不打包, 保留原始文件夹)
+        files = sorted(os.listdir(pkg_dir))
+        print(f"[pkg]      {pkg}/  ({n_nb} notebook) -> {files}")
 
 
 if __name__ == "__main__":
