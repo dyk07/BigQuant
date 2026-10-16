@@ -24,6 +24,7 @@
 - 不做任何手工因子(滚动统计/量价组合/盘口不平衡), 只做单位还原、量纲统一、
   对数变换与缺失值处理, 符合"基础算子"边界。
 """
+import gc
 import json
 import math
 import os
@@ -58,6 +59,46 @@ ALIGNED_MINUTES = [AUCTION_MINUTE] + [
     m for m in range(AFTERNOON_START + SAMPLE_STEP, AFTERNOON_END + 1, SAMPLE_STEP)
 ]
 
+
+def _trim():
+    """把 glibc 空闲内存(main arena)归还操作系统, 压低 RSS 峰值。
+
+    多频重采样/对齐会 malloc 大量临时缓冲, glibc 默认把释放的 chunk 留在
+    arena 里备用; 逐月累积时这些保留内存会叠加成 RSS 尖峰。显式 trim 可在
+    每个月的临时数据 `del` + `gc.collect()` 之后真正把内存交还内核, 让
+    私榜重训(默认 48 个月, 平台限制 **30GB**)与公榜/评测(限制 **51200MB**)
+    都留出充足余量。非 glibc 平台静默跳过 (import 失败即忽略)。
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _concat_inplace(arrs):
+    """把若干同宽数组拼成一个**新**矩阵, 逐块拷贝后立即释放源块。
+
+    相比 `np.concatenate(arrs)`(拼接瞬间源块与结果**同时**驻留, 峰值 ≈ 2×),
+    这里先分配结果, 再把每块**就地**拷入并随即把源块置空, 峰值只比结果多一个
+    "最小块"。逐月累积 48 个月的特征矩阵时, 这一处能省下接近一整份特征矩阵
+    (数 GB) 的瞬时尖峰。仅用于 2D 特征矩阵 (y/keys 极小, 仍走原逻辑)。
+    """
+    arrs = [a for a in arrs if a is not None and len(a)]
+    if not arrs:
+        return None
+    if len(arrs) == 1:
+        return arrs[0]
+    out = np.empty((sum(len(a) for a in arrs),) + arrs[0].shape[1:],
+                   dtype=arrs[0].dtype)
+    pos = 0
+    for i, a in enumerate(arrs):
+        out[pos:pos + len(a)] = a
+        pos += len(a)
+        arrs[i] = None
+    return out
+
+
 # 需要的原始列(e2e 表 schema)
 _PRICE_FIELDS = ["open", "high", "low", "close", "amount",
                  "ask_price1", "ask_price2", "ask_price3",
@@ -76,6 +117,29 @@ ORDERBOOK_FEATURES = (
 )
 ALL_FEATURES = KLINE_FEATURES + ORDERBOOK_FEATURES
 N_FEATURES = len(ALL_FEATURES)  # 25
+
+# ==========================================================================
+# 内存策略 (平台硬限制: 公榜/评测 51200MB, 私榜重训 30GB, 超限强制终止)
+# --------------------------------------------------------------------------
+# 1. **只 SELECT 需要的列**, 并尽早降为 float32, 丢掉 adjust_factor 等无关列;
+# 2. **按自然月分块读取**, 每块处理完立即释放原始 DataFrame (del + gc + _trim);
+# 3. **不物化 [N,T,25] 滑窗矩阵**, 只保留 "特征矩阵 + 采样锚点下标",
+#    窗口在喂模型时按 batch 现场 gather (内存 O(batch*T*F) ~ 50MB);
+# 4. 标准化是逐列仿射运算, 作用在**特征矩阵**上一次即可,
+#    与作用在每个窗口上完全等价, 但内存降为 1/T;
+# 5. 每个分块前后各多读 PAD_DAYS 天, 保证跨月/跨日的输入窗口与
+#    标签窗口都能回看/前瞻到真实 bar (锚点仍严格限制在本块区间内, 不重复);
+# 6. 逐月累积出的特征矩阵最后用 `_concat_inplace` 合并 (峰值只比结果多一小块),
+#    取代 `np.concatenate`(拼接瞬间 ≈ 2× 结果) 的瞬时尖峰;
+# 7. 每月末调用 `_trim()` 把 glibc 空闲 arena 归还内核, 大幅压低常驻 RSS。
+# ==========================================================================
+PAD_DAYS = 10          # 分块读取时向前/向后额外缓冲的天数
+_SCALE_COLS = (_OHLC + ["amount", "deal_number"]
+               + [f"{s}_price{i}" for s in ("ask", "bid") for i in (1, 2, 3)])
+
+# 从表里真正要取的列(裁剪掉 adjust_factor 等)
+NEEDED_COLS = ["date", "instrument_id", "volume"] + _SCALE_COLS + _BOOK
+NEEDED_COLS = list(dict.fromkeys(NEEDED_COLS))
 
 
 # ==========================================================================
@@ -223,41 +287,13 @@ def build_model(model_cfg):
 # ==========================================================================
 # 数据: 读表 -> 还原 -> 重采样 -> 特征 -> 切窗
 # ==========================================================================
-def _fetch_table(table, start, end):
+def _pick_cols(df, start=None, end=None):
+    """只保留训练/推理真正需要的列, 并按 [start-PAD, end+PAD] 过滤, 同时降 dtype。
+
+    日期过滤对内存**至关重要**: 当 `table` 是已物化的 DataFrame (平台表对象 / 本地
+    验证) 时, 不过滤就会让每个月都重复处理整段数据 (48 个月 × 全量)。
+    用 `df.loc[mask, keep]` 一次完成 行过滤 + 列裁剪, 只产生**一份**拷贝。
     """
-    取数据为 DataFrame。
-
-    - DataFrame: 直接使用;
-    - 平台表对象: 经 to_pandas()/to_df()/df() 取出;
-    - 表名(str/可 f-string 化): 走 dai.query, **必须带日期过滤**
-      (平台会提供约 1 年前置数据, 不加过滤会把整表读入内存 -> OOM/超时)。
-      额外向前多取 10 天, 保证 start 当日的输入窗口能回看到历史 bar。
-    """
-    if isinstance(table, pd.DataFrame):
-        return table
-    for attr in ("to_pandas", "to_df"):
-        if hasattr(table, attr):
-            obj = getattr(table, attr)
-            return obj() if callable(obj) else obj
-    if hasattr(table, "df"):
-        obj = table.df
-        return obj() if callable(obj) else obj
-    # 表名: 用 dai 查询并只取 [start - 10 天, end]
-    import dai
-    buf = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
-    end_s = pd.Timestamp(end).strftime("%Y-%m-%d %H:%M:%S")
-    return dai.query(f"SELECT * FROM {table}",
-                     filters={"date": [buf, end_s]}).df()
-
-
-# 向后兼容别名(旧调用名)
-def _to_dataframe(table, start=None, end=None):
-    return _fetch_table(table, start, end)
-
-
-def _normalize(df):
-    """归一列名: 时间列 -> date, 标的列 -> instrument_id。"""
-    df = df.copy()
     ren = {}
     for c in df.columns:
         lc = c.lower()
@@ -265,58 +301,204 @@ def _normalize(df):
             ren[c] = "date"
         elif lc in ("instrument", "symbol", "stock", "code", "sid"):
             ren[c] = "instrument_id"
-    df = df.rename(columns=ren)
+    if ren:
+        df = df.rename(columns=ren)
+    keep = [c for c in NEEDED_COLS if c in df.columns]
+    if "date" not in keep or "instrument_id" not in keep:
+        raise ValueError(f"表缺少必要列 date/instrument_id; 实际列={list(df.columns)}")
+
+    mask = None
+    if start is not None and end is not None and "date" in df.columns:
+        dt = pd.to_datetime(df["date"])
+        lo = pd.Timestamp(start) - pd.Timedelta(days=PAD_DAYS)
+        hi = pd.Timestamp(end) + pd.Timedelta(days=PAD_DAYS)
+        tz = getattr(dt.dtype, "tz", None)
+        if tz is not None:
+            lo, hi = lo.tz_localize(tz), hi.tz_localize(tz)
+        mask = ((dt >= lo) & (dt <= hi)).to_numpy()
+    df = df[keep] if mask is None else df.loc[mask, keep]
+    return _shrink(df)
+
+
+def _fetch_table(table, start, end, columns=None):
+    """
+    取数据为 DataFrame (**只取需要的列**, 且必须带日期过滤)。
+
+    - DataFrame: 直接裁剪列 + 按 [start-PAD, end+PAD] 过滤;
+    - 平台表对象: 经 to_pandas()/to_df()/df() 取出后同样裁剪/过滤;
+    - 表名(str/可 f-string 化): 走 dai.query, **只 SELECT 需要的列 + 日期过滤**
+      (平台会提供约 1 年前置数据, 不加过滤会把整表读入内存 -> OOM/超时)。
+
+    注意: 调用方负责传**已经含缓冲**的 [start, end] (见 _month_windows)。
+    """
+    cols = list(columns or NEEDED_COLS)
+    if isinstance(table, pd.DataFrame):
+        return _pick_cols(table, start, end)
+    for attr in ("to_pandas", "to_df"):
+        if hasattr(table, attr):
+            obj = getattr(table, attr)
+            out = obj() if callable(obj) else obj
+            return _pick_cols(out, start, end)
+    if hasattr(table, "df"):
+        obj = table.df
+        out = obj() if callable(obj) else obj
+        return _pick_cols(out, start, end)
+    # 表名: 用 dai 查询, 只 SELECT 需要的列 + 日期过滤
+    import dai
+    buf = (pd.Timestamp(start) - pd.Timedelta(days=PAD_DAYS)).strftime("%Y-%m-%d")
+    end_s = (pd.Timestamp(end) + pd.Timedelta(days=PAD_DAYS)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    sel = ", ".join(cols) if isinstance(table, str) else "*"
+    sql = f"SELECT {sel} FROM {table}"
+    out = dai.query(sql, filters={"date": [buf, end_s]}).df()
+    return _pick_cols(out)      # SQL 侧已过滤, 不再重复过滤
+
+
+# 向后兼容别名(旧调用名)
+def _to_dataframe(table, start=None, end=None):
+    return _fetch_table(table, start, end)
+
+
+def _shrink(df):
+    """把还原后的 DataFrame 压到最小内存占用 (float32 + int16 标的)。"""
+    if "instrument_id" in df.columns:
+        df["instrument_id"] = pd.to_numeric(
+            df["instrument_id"], downcast="integer")
+    for c in df.columns:
+        if c in ("date", "day", "minute_of_day", "instrument_id"):
+            continue
+        if pd.api.types.is_float_dtype(df[c]):
+            df[c] = df[c].astype("float32")
+    return df
+
+
+def _month_windows(start, end):
+    """把 [start, end] 按自然月切成若干块, 返回 [(first_day, last_day, blocks)]。
+
+    只有落在 [start, end] 内的月份才产生数据块 (缓冲由 _fetch_table 负责),
+    因此块与块之间不会重复采样, 避免跨月重复计数。
+    """
+    months = pd.period_range(pd.Timestamp(start).to_period("M"),
+                             pd.Timestamp(end).to_period("M"), freq="M")
+    return [(m.start_time, m.end_time) for m in months]
+
+
+def _normalize(df):
+    """归一列名 + 裁剪列 + 时间/dtype 规整 (只保留必需列, 降内存)。"""
+    ren = {}
+    for c in df.columns:
+        lc = c.lower()
+        if lc in ("time", "datetime", "date"):
+            ren[c] = "date"
+        elif lc in ("instrument", "symbol", "stock", "code", "sid"):
+            ren[c] = "instrument_id"
+    if ren:
+        df = df.rename(columns=ren)
+    keep = [c for c in NEEDED_COLS if c in df.columns]
+    if "date" not in keep or "instrument_id" not in keep:
+        raise ValueError(f"表缺少必要列 date/instrument_id; 实际列={list(df.columns)}")
+    df = df[keep]
     df["date"] = pd.to_datetime(df["date"])
+    df["instrument_id"] = pd.to_numeric(df["instrument_id"], downcast="integer")
     return df
 
 
 def restore_units(df):
     """单位还原: OHLC 的 -1 -> NaN 并 /100; amount/盘口价格 /100;
-    盘口价格为 0 表示该侧无挂单 -> NaN(0 不是 0 元)。"""
-    df = df.copy()
+    盘口价格为 0 表示该侧无挂单 -> NaN(0 不是 0 元)。
+
+    就地修改 (不 copy), 并把结果降为 float32 以节省内存。
+    """
     for f in _OHLC:
         if f in df.columns:
-            df[f] = df[f].astype("float64")
-            df.loc[df[f] == -1, f] = np.nan
-            df[f] = df[f] / 100.0
+            df[f] = df[f].where(df[f] != -1).astype("float32") / 100.0
     for f in _PRICE_FIELDS:
         if f in df.columns and f not in _OHLC:
-            df[f] = df[f].astype("float64") / 100.0
+            df[f] = df[f].astype("float32") / 100.0
     for f in _BOOK:
         if f in df.columns and f.endswith(("1", "2", "3")) and "price" in f:
-            df.loc[df[f] == 0.0, f] = np.nan
+            df[f] = df[f].where(df[f] != 0.0)
+    for f in ("volume", "deal_number"):
+        if f in df.columns:
+            df[f] = df[f].astype("float32")
+    for f in [c for c in _BOOK if "price" not in c]:
+        if f in df.columns:
+            df[f] = df[f].astype("float32")
+    # dtype 已在 _pick_cols 里降过 (float32/int16), 这里无需再 _shrink 一次拷贝
     return df
 
 
 def tag_time(df):
-    """打时间标签: minute_of_day; 剔除 09:25 之前的盘前指示价 bar(保留 09:25)。"""
-    df = df.copy()
-    mod = (df["date"].dt.hour * 60 + df["date"].dt.minute).astype("int32")
-    keep = mod >= AUCTION_MINUTE
-    df = df[keep].copy()
-    df["minute_of_day"] = mod[keep].astype("int16")
-    df["day"] = df["date"].dt.normalize()
-    return df
+    """打时间标签: minute_of_day; 剔除 09:25 之前的盘前指示价 bar(保留 09:25)。
+
+    就地修改, 只保留交易时段内的行 (09:25 之后) 以进一步压缩内存。
+    """
+    dt = df["date"]
+    is_dt = pd.api.types.is_datetime64_any_dtype(dt)
+    mod = ((dt.dt.hour * 60 + dt.dt.minute) if is_dt
+           else np.floor(dt.to_numpy("int64") / 60) % 1440).astype("int16")
+    df["minute_of_day"] = mod
+    df["day"] = ((dt.dt.normalize().dt.tz_localize(None)) if is_dt
+                 else pd.to_datetime(df["date"].astype("int64"), unit="m")
+                 .dt.normalize())
+    # 先补列再过滤, 避免在切片上赋值 (SettingWithCopyWarning / 隐式拷贝)
+    return df[df["minute_of_day"] >= AUCTION_MINUTE]
 
 
 def resample_bars(df1m, kmins):
     """
-    把 1 分钟 bar 聚合成 kmins 分钟 bar。
+    把 1 分钟 bar 聚合成 kmins 分钟 bar (**低内存**)。
 
     规则: 09:25 集合竞价 bar 原样保留; 连续竞价段(09:30 起)按
     `end = 09:30 + ceil((mod-09:30)/K)*K` 分桶, OHLC=首/高/低/末,
     volume/amount/deal_number=求和, 盘口字段=末值(快照)。
     已实测与原生 bar5m/bar15m/bar30m 数值逐位一致。
 
-    关键: 必须按 (instrument_id, day, date) 排序后再取 first/last, 否则
+    内存策略 (旧实现峰值 ~4×输入, 是主要 OOM 来源):
+      * 排序: 数据本身已按 (instrument, 时间) 有序 -> 先探测, 有序则**零拷贝**;
+      * 不再切出 auction / cont 两份大拷贝, 而是用**分组键数组**直接 groupby:
+        - auction 行 (09:25) 的桶键置 -1, 聚合后按桶键 >=0 过滤丢弃;
+        - 连续竞价行的桶键用纯 numpy 定点计算 (不产生中间 Series);
+      * 不往 df 里插临时列 (避免触发整表 copy), 最终只 concat 出 ~20 万行的结果。
+
+    关键: 必须按 (instrument_id, 时间) 有序后再取 first/last, 否则
     `open`/`close`/盘口快照 会因输入未按时间排序而取错。
     """
-    df = df1m.sort_values(["instrument_id", "date"], kind="mergesort")
-    auction = df[df["minute_of_day"] == AUCTION_MINUTE].copy()
-    cont = df[df["minute_of_day"] > AUCTION_MINUTE].copy()
+    inst = df1m["instrument_id"].to_numpy()
+    ti = df1m["minute_of_day"].to_numpy().astype("int64", copy=False)
+    if len(inst) > 1:
+        # 探测是否已按 (instrument asc, minute asc) 有序
+        desc = (inst[1:] < inst[:-1]) | ((inst[1:] == inst[:-1]) & (ti[1:] < ti[:-1]))
+        df = df1m if not bool(desc.any()) else df1m.sort_values(
+            ["instrument_id", "date"], kind="mergesort")
+    else:
+        df = df1m
+    if df is not df1m:
+        inst = df["instrument_id"].to_numpy()
+        ti = df["minute_of_day"].to_numpy().astype("int64", copy=False)
+    if not pd.api.types.is_datetime64_any_dtype(df["day"]):
+        df = df.assign(day=pd.to_datetime(df["day"]))
+        inst = df["instrument_id"].to_numpy()
+        ti = df["minute_of_day"].to_numpy().astype("int64", copy=False)
 
-    rel = cont["minute_of_day"].to_numpy() - MORNING_START
-    cont["_end"] = MORNING_START + np.ceil(rel / kmins).astype("int64") * kmins
+    cols = ["instrument_id", "minute_of_day", "day"] + list(_OHLC) + \
+        ["volume", "amount", "deal_number"] + _BOOK
+    cols = [c for c in cols if c in df.columns]
+
+    is_auc = (ti == AUCTION_MINUTE)
+    auction = df.loc[is_auc, cols].copy()          # 每标的每天仅 1 行, 极小
+
+    # 桶键: 连续竞价 -> 09:30 + ceil((mod-09:30)/K)*K; 竞价行 -> -1
+    # 注意必须用 ceil (与平台 bar Kmin 口径一致): bar 09:31 归入 09:35 桶,
+    # 因此不会产生 "09:30" 这种空桶。
+    rel = ti - MORNING_START
+    bucket = np.empty(len(df), "int64")
+    np.maximum(rel, 0, out=bucket)
+    np.add(bucket, kmins - 1, out=bucket)
+    np.floor_divide(bucket, kmins, out=bucket)
+    np.multiply(bucket, kmins, out=bucket)
+    np.add(bucket, MORNING_START, out=bucket)
+    bucket[is_auc] = -1
 
     agg = {"open": ("open", "first"), "high": ("high", "max"),
            "low": ("low", "min"), "close": ("close", "last"),
@@ -325,14 +507,14 @@ def resample_bars(df1m, kmins):
     for c in _BOOK:
         agg[c] = (c, "last")
 
-    # 必须把 day 带进分组键, 否则连续竞价段丢失交易日标签(跨日会串)
-    g = (cont.groupby(["instrument_id", "day", "_end"], sort=False)
-             .agg(**agg).reset_index()
-             .rename(columns={"_end": "minute_of_day"}))
+    # 分组键必须是 (instrument, day, bucket), 否则跨日/跨标的会串
+    g = (df.groupby([inst, df["day"].to_numpy(), bucket], sort=False)
+           .agg(**agg).reset_index())
+    g.columns = ["instrument_id", "day", "minute_of_day"] + list(agg.keys())
+    g = g[g["minute_of_day"] >= 0]                 # 丢弃集合竞价的分组
 
-    cols = ["instrument_id", "minute_of_day", "day"] + list(agg.keys())
-    a = auction[[c for c in cols if c in auction.columns]]
-    out = pd.concat([a, g[[c for c in cols if c in g.columns]]], ignore_index=True)
+    out = pd.concat([auction, g[[c for c in cols if c in g.columns]]],
+                    ignore_index=True)
     out["date"] = (pd.to_datetime(out["day"])
                    + pd.to_timedelta(out["minute_of_day"], unit="m"))
     return (out.dropna(subset=["day"])
@@ -341,28 +523,50 @@ def resample_bars(df1m, kmins):
 
 
 def build_features(df):
-    """构造 25 个特征(只做单位/量纲统一与对数变换)。"""
-    close = df["close"]
+    """构造 25 个特征(只做单位/量纲统一与对数变换), 返回 float32 矩阵。
+
+    直接返回 **ndarray** 而非 DataFrame: 25 列 float32 是窗口 gather 的底层存储,
+    省掉一遍 DataFrame 拷贝。
+    """
+    close = df["close"].to_numpy(dtype="float32", copy=False)
     valid = close > 0
-    out = pd.DataFrame(index=df.index)
-    out["open_rel"] = np.where(valid, df["open"] / close - 1.0, np.nan)
-    out["high_rel"] = np.where(valid, df["high"] / close - 1.0, np.nan)
-    out["low_rel"] = np.where(valid, df["low"] / close - 1.0, np.nan)
+    n = len(df)
+    out = np.empty((n, N_FEATURES), dtype="float32")
+
+    def put(name, vals):
+        out[:, ALL_FEATURES.index(name)] = vals
+
+    def rel(col):
+        v = df[col].to_numpy(dtype="float32", copy=False)
+        return np.where(valid, v / np.where(valid, close, 1.0) - 1.0, np.nan)
+
+    put("open_rel", rel("open"))
+    put("high_rel", rel("high"))
+    put("low_rel", rel("low"))
+    # close_ret: 同一 (instrument, day) 内上一根 bar 的 close
     prev = df.groupby(["instrument_id", "day"], sort=False)["close"].shift(1)
-    out["close_ret"] = np.where(prev > 0, close / prev - 1.0, np.nan)
-    out["log_volume"] = np.log1p(df["volume"].clip(lower=0))
-    out["log_amount"] = np.log1p(df["amount"].clip(lower=0))
-    out["log_deal_number"] = np.log1p(df["deal_number"].clip(lower=0))
+    prev = prev.to_numpy(dtype="float32", copy=False)
+    put("close_ret", np.where(prev > 0, close / np.where(prev > 0, prev, 1.0) - 1.0,
+                              np.nan))
+    for name, col in (("log_volume", "volume"), ("log_amount", "amount"),
+                      ("log_deal_number", "deal_number")):
+        put(name, np.log1p(np.clip(df[col].to_numpy(dtype="float32", copy=False),
+                                   0.0, None)))
     for i in (1, 2, 3):
         for s in ("ask", "bid"):
-            out[f"{s}_price{i}_rel"] = np.where(valid, df[f"{s}_price{i}"] / close - 1.0, np.nan)
-            out[f"log_{s}_volume{i}"] = np.log1p(df[f"{s}_volume{i}"].clip(lower=0))
-            out[f"log_{s}_orders{i}"] = np.log1p(df[f"{s}_num_orders{i}"].clip(lower=0))
-    return out[ALL_FEATURES]
+            put(f"{s}_price{i}_rel", rel(f"{s}_price{i}"))
+            put(f"log_{s}_volume{i}",
+                np.log1p(np.clip(df[f"{s}_volume{i}"].to_numpy("float32", copy=False),
+                                 0.0, None)))
+            put(f"log_{s}_orders{i}",
+                np.log1p(np.clip(
+                    df[f"{s}_num_orders{i}"].to_numpy("float32", copy=False),
+                    0.0, None)))
+    return out
 
 
 def build_labels(df, horizon_bars):
-    """标签 = future_vwap / close[t+h] - 1, 窗口不跨交易日。"""
+    """标签 = future_vwap / close[t+h] - 1, 窗口不跨交易日 (float32)。"""
     grp = [df["instrument_id"], df["day"]]
     amt64 = df["amount"].astype("float64")
     vol64 = df["volume"].astype("float64")
@@ -374,22 +578,25 @@ def build_labels(df, horizon_bars):
     end = df["close"].astype("float64").groupby(grp, sort=False).shift(-horizon_bars)
     close = df["close"].to_numpy(dtype="float64")
     end_a = end.to_numpy(dtype="float64")
-    lab = np.where((close > 0) & (end_a > 0), fwd_vwap / np.where(end_a > 0, end_a, 1.0) - 1.0, np.nan)
+    lab = np.where((close > 0) & (end_a > 0),
+                   fwd_vwap / np.where(end_a > 0, end_a, 1.0) - 1.0, np.nan)
     return lab.astype("float32")
 
 
-def make_samples(feat, label, df, seq_len, minutes, with_label=True):
-    """向量化滑窗: 返回 (X[N,T,F], y[N], keys[N,3]=inst,day_ord,mod)。
+def make_anchors(feat, label, df, seq_len, minutes, with_label=True):
+    """**不物化窗口**: 只返回采样锚点下标 + 元信息。
 
-    采样点按**时钟分钟**对齐。输入窗口只要求**同一只股票**(允许回溯到前一日,
-    与训练口径 input_same_day_only=False 一致; 标签窗口仍严格当日)。"""
+    窗口在喂模型时用 `gather_windows(feat, sel, seq_len)` 现场 gather,
+    因此内存从 O(N·T·F) 降到 O(N)。anchor 语义与旧 `make_samples` 完全一致:
+    采样点按**时钟分钟**对齐; 输入窗口只要求**同一只股票**(允许回溯到前一日,
+    与训练口径 input_same_day_only=False 一致); 标签窗口仍严格当日。
+    """
     n = len(df)
     if n <= seq_len:
-        return (np.zeros((0, seq_len, N_FEATURES), "float32"),
-                np.zeros((0,), "float32"), np.zeros((0, 3), "int64"))
+        return (np.zeros((0,), "int64"), np.zeros((0,), "int64"),
+                np.zeros((0,), "int64"), np.zeros((0, 3), "int64"))
     inst = df["instrument_id"].to_numpy()
     mod = df["minute_of_day"].to_numpy()
-    # day 归一为"自 epoch 起的天数"(int64), 便于存取与比较
     day = pd.to_datetime(df["day"]).to_numpy().astype("datetime64[D]").astype("int64")
 
     i = np.arange(seq_len, n)
@@ -399,46 +606,228 @@ def make_samples(feat, label, df, seq_len, minutes, with_label=True):
         keep &= ~np.isnan(label[i])
     sel = i[keep]
     if sel.size == 0:
-        return (np.zeros((0, seq_len, N_FEATURES), "float32"),
-                np.zeros((0,), "float32"), np.zeros((0, 3), "int64"))
-    win = sel[:, None] + np.arange(-seq_len, 0)[None, :]
-    X = feat[win].astype("float32")
+        return (np.zeros((0,), "int64"), np.zeros((0,), "int64"),
+                np.zeros((0,), "int64"), np.zeros((0, 3), "int64"))
     y = label[sel].astype("float32") if with_label else np.zeros(len(sel), "float32")
-    keys = np.stack([inst[sel], day[sel].astype("int64"), mod[sel]], axis=1)
-    return X, y, keys
+    keys = np.stack([inst[sel].astype("int64"), day[sel].astype("int64"),
+                     mod[sel].astype("int64")], axis=1)
+    return sel.astype("int64"), y, keys
 
 
-class _FreqData:
-    """单频: 构造特征 + (可选)标签 + 滑窗。"""
+def gather_windows(feat, sel, seq_len, out=None):
+    """把锚点 sel 的 [T, F] 输入窗口 gather 成 [N, T, F] (仅在喂模型时调用)。
 
-    def __init__(self, df1m, freq, seq_len, minutes, with_label=True):
-        self.freq = freq
-        self.seq_len = seq_len
-        km = FREQ_MINUTES[freq]
-        bars = resample_bars(df1m, km)
-        feat = build_features(bars).to_numpy(dtype="float32")
-        lab = build_labels(bars, max(1, HORIZON_MINUTES // km)) if with_label \
-            else np.full(len(bars), np.nan, "float32")
-        self.X, self.y, self.keys = make_samples(feat, lab, bars.reset_index(drop=True),
-                                                 seq_len, minutes, with_label)
+    等价于旧 `feat[sel[:,None] + arange(-T,0)]`, 但可按 batch 调用 -> 内存 O(batch·T·F)。
+    """
+    n = len(sel)
+    if n == 0:
+        return np.zeros((0, seq_len, N_FEATURES), "float32")
+    if out is None:
+        out = np.empty((n, seq_len, N_FEATURES), dtype="float32")
+    offsets = seq_len - 1
+    for j in range(seq_len):                      # 按时间步 gather, 避免造 idx 矩阵
+        out[:, j, :] = feat[sel - offsets + j]
+    return out
+
+
+def _scale_feat(feat, mean, std):
+    """在**特征矩阵**上做标准化 (与逐窗口标准化完全等价, 内存降为 1/T)。"""
+    np.subtract(feat, np.asarray(mean, "float32").reshape(1, -1), out=feat)
+    np.divide(feat, np.asarray(std, "float32").reshape(1, -1), out=feat)
+    np.nan_to_num(feat, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return feat
+
+
+def _make_freq(df, freq, seq_len, minutes, with_label=True, stats=None):
+    """单频: 重采样 -> 特征 -> (可选)标签 -> 采样锚点; 就地标准化并释放中间量。
+
+    返回 dict: keys, y(或 None), anchors, feat(已标准化), sort_idx (按 keys 排序)。
+    """
+    km = FREQ_MINUTES[freq]
+    bars = resample_bars(df, km)
+    feat = build_features(bars)
+    lab = (build_labels(bars, max(1, HORIZON_MINUTES // km)) if with_label
+           else np.zeros(len(bars), "float32"))
+    sel, y, keys = make_anchors(feat, lab, bars.reset_index(drop=True),
+                                seq_len, minutes, with_label)
+    del lab
+    if stats is not None:
+        feat = _scale_feat(feat, stats[0], stats[1])
+    order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0])) if len(keys) else \
+        np.zeros(0, "int64")
+    return {"freq": freq, "seq_len": seq_len, "keys": keys, "y": y,
+            "anchors": sel, "feat": feat, "order": order,
+            "n_bars": len(bars)}
 
 
 def _subset_freq(fd, sel):
-    """按行下标取 _FreqData 的子集(用于把采样时刻限制在测试区间)。"""
-    o = _FreqData.__new__(_FreqData)
-    o.freq, o.seq_len = fd.freq, fd.seq_len
-    o.X = fd.X[sel]
-    o.y = fd.y[sel]
-    o.keys = fd.keys[sel]
+    """按行下标取单频子集 (用于把采样时刻限制在测试区间)。"""
+    o = dict(fd)
+    o["keys"] = fd["keys"][sel]
+    o["y"] = None if fd["y"] is None else fd["y"][sel]
+    o["anchors"] = fd["anchors"][sel]
     return o
 
 
-def _fit_scaler(X, chunk=200_000):
-    """训练集特征均值/标准差(分块累加, 忽略 NaN)。"""
-    nf = X.shape[-1]
+def _align_freqs(per, freqs):
+    """多频: 按 keys 取交集(严格同一决策时刻), 返回 {freq: 行下标}。"""
+    if len(freqs) == 1:
+        return {freqs[0]: np.arange(len(per[freqs[0]]["keys"]))}
+    common = set.intersection(*[set(map(tuple, per[f]["keys"].tolist()))
+                                for f in freqs])
+    common = set(sorted(common))
+    out = {}
+    for f in freqs:
+        k = per[f]["keys"]
+        mask = np.fromiter((tuple(r) in common for r in k.tolist()),
+                           dtype=bool, count=len(k))
+        out[f] = np.where(mask)[0]
+    return out
+
+
+def _month_span(month):
+    """把 'YYYYMM' 转成 (月首时间戳, 月末时间戳)。"""
+    p = pd.Period(str(month), freq="M")
+    return p.start_time, p.end_time
+
+
+def _empty_month(freqs, seq_lens):
+    return ([np.zeros((0, int(seq_lens.get(f, 1)), N_FEATURES), "float32")
+             for f in freqs],
+            np.zeros(0, "float32"),
+            pd.DataFrame({"date": [], "instrument": [], "minute_of_day": []}),
+            np.zeros((0, 3), "int64"))
+
+
+def _build_month(table, first, last, mode, minutes, stats, freqs, seq_lens):
+    """构造**单个月**的模型输入 (原始 1 分钟表用后即弃 -> 内存峰值 ~1 个月)。
+
+    返回 (X_list, y, idx_df, keys); 锚点严格限制在 [first, last] 内,
+    因此按月调用不会跨月重复采样。stats 为 dict{freq: (mean, std)}。
+    """
+    with_label = (mode != "infer")
+    raw = _normalize(_fetch_table(table, first, last))
+    if len(raw) == 0:
+        return _empty_month(freqs, seq_lens)
+    raw = restore_units(raw)
+    raw = tag_time(raw)
+
+    per = {}
+    for f in freqs:
+        T = int(seq_lens.get(f, max(1, CFG.LOOKBACK_MINUTES // FREQ_MINUTES[f])))
+        per[f] = _make_freq(raw, f, T, minutes, with_label=with_label,
+                            stats=(stats or {}).get(f))
+    # 把锚点限制在这一个月内 (避免缓冲期重复采样)
+    d0 = np.datetime64(pd.Timestamp(first).date(), "D").astype("int64")
+    d1 = np.datetime64(pd.Timestamp(last).date(), "D").astype("int64")
+    for f in freqs:
+        k = per[f]["keys"]
+        if len(k):
+            m = (k[:, 1] >= d0) & (k[:, 1] <= d1)
+            per[f] = _subset_freq(per[f], np.where(m)[0])
+
+    # 多频按 keys 取交集(严格同一决策时刻)
+    idx = _align_freqs(per, freqs)
+    ref = per[freqs[0]]
+    j0 = idx[freqs[0]]
+    keys = ref["keys"][j0]
+    y = (ref["y"][j0] if ref["y"] is not None
+         else np.zeros(len(keys), "float32")).astype("float32")
+
+    X_list = []
+    for f in freqs:
+        T = int(seq_lens.get(f, max(1, CFG.LOOKBACK_MINUTES // FREQ_MINUTES[f])))
+        X_list.append(gather_windows(per[f]["feat"], per[f]["anchors"][idx[f]], T))
+    if len(keys):
+        idx_df = pd.DataFrame({
+            "date": (pd.to_datetime(keys[:, 1], unit="D")
+                     + pd.to_timedelta(keys[:, 2], unit="m")),
+            "instrument": keys[:, 0].astype("int64"),
+            "minute_of_day": keys[:, 2].astype("int64"),
+        })
+    else:
+        idx_df = pd.DataFrame({"date": [], "instrument": [], "minute_of_day": []})
+    del raw, per
+    gc.collect()
+    _trim()
+    return X_list, y, idx_df, keys
+
+
+def _norm_freqs(freqs, seq_lens, minutes):
+    freqs = list(freqs or ["bar30m"])
+    seq_lens = dict(seq_lens or {})
+    return freqs, seq_lens, (ALIGNED_MINUTES if minutes is None else minutes)
+
+
+def build_dataset(table, start_date, end_date, mode, minutes, stats,
+                  freqs=None, seq_lens=None):
+    """
+    从 1 分钟表构造模型输入 (**分月流式, 内存受限**)。
+
+    返回 (X_list, y, idx_df, keys):
+      X_list : list[np.float32[N, T_f, 25]]  每个频率一项(单频即长度 1)
+      y      : np.float32[N]  (infer 模式全 0)
+      idx_df : DataFrame[date, instrument, minute_of_day]  预测截面键
+      keys   : [N,3] (instrument_id, day_ordinal, minute_of_day)
+
+    内存策略: 逐月调用 `_build_month`, 每个月只读 [月初-PAD, 月末+PAD] 的 bar1m,
+    处理完立即释放; 采样锚点严格限制在该月内, 因此各块之间不重复。
+    依赖长区间的推理请改用 `_iter_dataset` (逐月 yield, 峰值只有 1 个月)。
+    stats  : dict{freq: (mean, std)}; 推理直接复用训练统计量。
+    """
+    freqs, seq_lens, minutes = _norm_freqs(freqs, seq_lens, minutes)
+    Xs_acc = [[] for _ in freqs]
+    ys, idxs, keyss = [], [], []
+    for first, last in _month_windows(start_date, end_date):
+        Xs, y, idx_df, keys = _build_month(
+            table, first, last, mode, minutes, stats, freqs, seq_lens)
+        if len(idx_df) == 0:
+            continue
+        for i in range(len(freqs)):
+            Xs_acc[i].append(Xs[i])
+        ys.append(y)
+        idxs.append(idx_df)
+        keyss.append(keys)
+    if not idxs:
+        return _empty_month(freqs, seq_lens)
+    X_list = [np.concatenate(a) if a else
+              np.zeros((0, int(seq_lens.get(f, 1)), N_FEATURES), "float32")
+              for a, f in zip(Xs_acc, freqs)]
+    idx_df = pd.concat(idxs, ignore_index=True)
+    return X_list, np.concatenate(ys), idx_df, np.concatenate(keyss)
+
+
+def _iter_dataset(table, start_date, end_date, mode, minutes, stats,
+                  freqs=None, seq_lens=None):
+    """**逐月 yield** 单月模型输入 (推理用)。
+
+    每次 yield `(X_list, y, idx_df, keys)`, 调用方消费完即可释放 -> 峰值内存
+    只有 1 个月的窗口 (~数百 MB), 长测试区间也不会触发平台 51200MB 限制。
+    """
+    freqs, seq_lens, minutes = _norm_freqs(freqs, seq_lens, minutes)
+    for first, last in _month_windows(start_date, end_date):
+        Xs, y, idx_df, keys = _build_month(
+            table, first, last, mode, minutes, stats, freqs, seq_lens)
+        if len(idx_df) == 0:
+            continue
+        yield Xs, y, idx_df, keys
+        # 调用方已消费完本月张量 -> 显式释放并归还 glibc 空闲 arena,
+        # 使长评测区间的常驻 RSS 稳定在"单月"量级 (与 _accumulate 同策略)。
+        del Xs, y, idx_df, keys
+        gc.collect()
+        _trim()
+
+
+def _fit_scaler(feat, chunk=1_000_000):
+    """在**特征矩阵** [n_bars, F] 上算均值/标准差 (分块累加, 忽略 NaN)。
+
+    注: 训练统计量沿用"在 bar 级特征矩阵上 fit"的口径 (与推理侧复用同一公式),
+    标准化是逐列仿射, 作用在 feat 上与作用在窗口上结果一致, 但内存降为 1/T。
+    """
+    nf = feat.shape[-1]
     s = np.zeros(nf, "float64"); sq = np.zeros(nf, "float64"); c = np.zeros(nf, "float64")
-    for st in range(0, len(X), chunk):
-        blk = X[st:st + chunk].reshape(-1, nf).astype("float64")
+    for st in range(0, len(feat), chunk):
+        blk = feat[st:st + chunk].astype("float64")
         m = ~np.isnan(blk)
         z = np.where(m, blk, 0.0)
         s += z.sum(0); sq += (z * z).sum(0); c += m.sum(0)
@@ -449,20 +838,6 @@ def _fit_scaler(X, chunk=200_000):
     mean = np.where(np.isnan(mean), 0.0, mean)
     std = np.where((np.isnan(std)) | (std < 1e-6), 1.0, std)
     return mean.astype("float32"), std.astype("float32")
-
-
-def _apply_scaler(X, mean, std):
-    """逐样本标准化, NaN -> 0(训练集均值)。"""
-    out = X.astype("float32", copy=False)
-    mean = np.asarray(mean, "float32").reshape(1, 1, -1)
-    std = np.asarray(std, "float32").reshape(1, 1, -1)
-    chunk = max(1, 2_000_000 // max(out.shape[1], 1))
-    for st in range(0, len(out), chunk):
-        blk = out[st:st + chunk]
-        np.subtract(blk, mean, out=blk)
-        np.divide(blk, std, out=blk)
-        np.nan_to_num(blk, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    return out
 
 
 def _rank_targets(y, keys):
@@ -483,78 +858,6 @@ def clip_bounds(labels, lo=0.01, hi=0.99):
         return -np.inf, np.inf
     a, b = np.quantile(x, [lo, hi])
     return float(a), float(b)
-
-
-# ==========================================================================
-# 推理侧统一入口: build_dataset (训练脚本也用它, 保证口径一致)
-# ==========================================================================
-def build_dataset(table, start_date, end_date, mode, minutes, stats,
-                  freqs=None, seq_lens=None):
-    """
-    从 1 分钟表构造模型输入。
-
-    返回 (X_list, y, idx_df, keys):
-      X_list : list[np.float32[N, T_f, 25]]  每个频率一项(单频即长度 1)
-      y      : np.float32[N]  (infer 模式全 0)
-      idx_df : DataFrame[date, instrument, minute_of_day]  预测截面键
-      keys   : [N,3] (instrument_id, day_ordinal, minute_of_day)
-
-    stats  : dict{freq: (mean, std)}; 推理直接复用训练统计量。
-    """
-    freqs = freqs or ["bar30m"]
-    seq_lens = seq_lens or {}
-    if minutes is None:
-        minutes = ALIGNED_MINUTES
-
-    df = _normalize(_fetch_table(table, start_date, end_date))
-    df = restore_units(df)
-    df = tag_time(df)
-
-    with_label = (mode != "infer")
-    per = {}
-    for f in freqs:
-        T = int(seq_lens.get(f, max(1, 120 // FREQ_MINUTES[f])))
-        per[f] = _FreqData(df, f, T, minutes, with_label=with_label)
-
-    # 采样时刻限制在平台注入的测试区间[start_date, end_date]内; 表本身保留全量,
-    # 以便首日的输入窗口能向前回看到历史 bar(平台会提供约 1 年向前数据)。
-    d0 = np.datetime64(pd.Timestamp(start_date).date(), "D").astype("int64")
-    d1 = np.datetime64(pd.Timestamp(end_date).date(), "D").astype("int64")
-    for f in freqs:
-        k = per[f].keys
-        m = (k[:, 1] >= d0) & (k[:, 1] <= d1)
-        per[f] = _subset_freq(per[f], np.where(m)[0])
-
-    # 多频: 按 keys 取交集(严格同一决策时刻)
-    if len(freqs) > 1:
-        sets = [set(map(tuple, per[f].keys.tolist())) for f in freqs]
-        common = set.intersection(*sets)
-        common = set(sorted(common))
-        idx = {}
-        for f in freqs:
-            mask = np.fromiter((tuple(r) in common for r in per[f].keys.tolist()),
-                               dtype=bool, count=len(per[f].keys))
-            idx[f] = np.where(mask)[0]
-    else:
-        idx = {freqs[0]: np.arange(len(per[freqs[0]].keys))}
-
-    ref = freqs[0]
-    keys = per[ref].keys[idx[ref]]
-    y = per[ref].y[idx[ref]]
-
-    X_list = []
-    for f in freqs:
-        X = per[f].X[idx[f]]
-        mean, std = stats[f]
-        X_list.append(_apply_scaler(X, mean, std))
-
-    idx_df = pd.DataFrame({
-        "date": (pd.to_datetime(keys[:, 1], unit="D")
-                 + pd.to_timedelta(keys[:, 2], unit="m")),
-        "instrument": keys[:, 0].astype("int64"),
-        "minute_of_day": keys[:, 2].astype("int64"),
-    })
-    return X_list, y, idx_df, keys
 
 
 # ==========================================================================
@@ -608,31 +911,98 @@ def load_model(path, map_location="cpu"):
 # ==========================================================================
 # 训练
 # ==========================================================================
-def _load_range(table, months_or_start, end=None):
-    """按月份列表或日期区间读 1 分钟表, 返回还原+打标后的 DataFrame。"""
-    if end is None:
-        months = [str(m) for m in months_or_start]
-        # 取月份列表覆盖的日期范围, 只查询该区间(避免整表读入内存)
-        start_s = f"{months[0][:4]}-{months[0][4:6]}-01"
-        last = months[-1]
-        end_s = (pd.Timestamp(f"{last[:4]}-{last[4:6]}-01")
-                 + pd.offsets.MonthEnd(1)).strftime("%Y-%m-%d 23:59:59")
-        df = _normalize(_fetch_table(table, start_s, end_s))
-        df = restore_units(df)
-        mask = df["date"].dt.strftime("%Y%m").isin(months)
-        df = df[mask]
+def _accumulate(table, months, freqs, seq_lens, minutes, stats=None):
+    """**按月流式**累积训练张量: 只保留 "频率特征矩阵 + 锚点下标 + keys"。
+
+    内存关键点(平台硬限制 51200MB):
+      * 原始 bar1m 只在一个月的范围内驻留, 每月处理完立即 `del` + `gc.collect()`;
+      * **不物化 [N, T, F] 滑窗矩阵**, 只存 `feat` (N_bars×25) 与锚点 (N,);
+      * 多频严格按 (instrument, day, minute) 取交集, 与推理口径一致;
+      * 各月锚点都限制在本月内, 因此块与块之间不会重复采样。
+
+    返回 dict: feats{freq: [n_bars, 25] float32}, anchors{freq: [N] int64},
+               y[N] float32, keys[N, 3]
+    """
+    acc = {"feats": {f: [] for f in freqs}, "anchors": {f: [] for f in freqs},
+           "keys": [], "y": []}
+    off = {f: 0 for f in freqs}
+    for m in months:
+        first, last = _month_span(m)
+        raw = _normalize(_fetch_table(table, first, last))
+        if len(raw) == 0:
+            continue
+        raw = restore_units(raw)
+        raw = tag_time(raw)
+        per = {}
+        for f in freqs:
+            per[f] = _make_freq(raw, f, int(seq_lens[f]), minutes,
+                                with_label=True, stats=(stats or {}).get(f))
+        # 锚点限制在本月内, 避免缓冲期重复采样
+        d0 = np.datetime64(pd.Timestamp(first).date(), "D").astype("int64")
+        d1 = np.datetime64(pd.Timestamp(last).date(), "D").astype("int64")
+        for f in freqs:
+            k = per[f]["keys"]
+            if len(k):
+                mask = (k[:, 1] >= d0) & (k[:, 1] <= d1)
+                per[f] = _subset_freq(per[f], np.where(mask)[0])
+        # 多频取交集 -> 同一决策时刻
+        idx = _align_freqs(per, freqs)
+        j0 = idx[freqs[0]]
+        acc["keys"].append(per[freqs[0]]["keys"][j0])
+        acc["y"].append(per[freqs[0]]["y"][j0])
+        for f in freqs:
+            acc["feats"][f].append(per[f]["feat"])
+            # 锚点转为"拼接后特征矩阵"的全局行号
+            acc["anchors"][f].append(per[f]["anchors"][idx[f]] + off[f])
+            off[f] += len(per[f]["feat"])
+        del raw, per
+        gc.collect()
+        _trim()
+
+    out = {}
+    if not acc["keys"]:
+        out["keys"] = np.zeros((0, 3), "int64")
+        out["y"] = np.zeros(0, "float32")
     else:
-        df = _normalize(_fetch_table(table, months_or_start, end))
-        df = restore_units(df)
-        df = df[(df["date"] >= pd.Timestamp(months_or_start))
-                & (df["date"] <= pd.Timestamp(end))]
-    return tag_time(df)
+        out["keys"] = np.concatenate(acc["keys"])
+        out["y"] = np.concatenate(acc["y"]).astype("float32")
+    out["feats"] = {}
+    for f in freqs:
+        c = _concat_inplace(acc["feats"][f])
+        out["feats"][f] = (c if c is not None
+                           else np.zeros((0, N_FEATURES), "float32"))
+    out["anchors"] = {f: (np.concatenate(acc["anchors"][f]) if acc["anchors"][f]
+                          else np.zeros(0, "int64")) for f in freqs}
+    del acc
+    gc.collect()
+    _trim()
+    return out
 
 
-def _train_freqs(df1m, freqs, seq_lens, minutes, seed=SEED, epochs=None, lr=None,
-                 batch=None, patience=None, weight_decay=None,
-                 val_months=None):
-    """在给定 1 分钟数据上训练多频模型, 返回 (model, stats, model_cfg)。
+def _batch_windows(feats, anchors, row_idx, seq_lens, freqs, buf=None):
+    """按行下标现场 gather 一个 batch 的窗口 -> list[np.float32[b, T_f, 25]]。
+
+    复用 `buf`(预分配) 以避免每个 step 反复 malloc, 峰值内存 O(batch·T·F) ~ 50MB。
+    """
+    out = []
+    for f in freqs:
+        sel = anchors[f][row_idx]
+        if buf is not None and len(row_idx) == len(buf[f]):
+            b = buf[f]
+            gather_windows(feats[f], sel, int(seq_lens[f]), out=b)
+        else:
+            b = gather_windows(feats[f], sel, int(seq_lens[f]))
+        out.append(b)
+    return out
+
+
+def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
+                 epochs=None, lr=None, batch=None, patience=None,
+                 weight_decay=None, val_months=None):
+    """在给定 1 分钟表上训练多频模型, 返回 (model, stats, model_cfg)。
+
+    数据侧**分月流式**构造 (见 `_accumulate`): 训练集与验证集各扫一遍自己的月份,
+    全程不物化 [N, T, F] 滑窗矩阵, 窗口在训练 step 里按 batch 现场 gather。
 
     可复现性: 固定 Python / NumPy / PyTorch(含 CUDA) 随机种子, 并关闭 cudnn 的
     benchmark 自动调优, 使 CPU/GPU 结果尽量一致。
@@ -655,42 +1025,31 @@ def _train_freqs(df1m, freqs, seq_lens, minutes, seed=SEED, epochs=None, lr=None
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # 切分 train/val: 用末尾 val_months 个月做验证(时间序列, 不打乱)
-    months = sorted(df1m["date"].dt.strftime("%Y%m").unique())
+    # 切分 train/val: 末尾 val_months 个月做验证 (时间序列, 不打乱)
+    months = sorted(str(m) for m in train_months)
     val_m = months[-val_months:] if len(months) > val_months + 1 else months[-1:]
-    tr = df1m[~df1m["date"].dt.strftime("%Y%m").isin(val_m)].reset_index(drop=True)
-    va = df1m[df1m["date"].dt.strftime("%Y%m").isin(val_m)].reset_index(drop=True)
+    tr_m = [m for m in months if m not in set(val_m)]
+    print(f"  [data] train={len(tr_m)}月 val={len(val_m)}月 ({val_m[0]}~{val_m[-1]})")
 
-    tr_per = {f: _FreqData(tr, f, seq_lens[f], minutes) for f in freqs}
-    va_per = {f: _FreqData(va, f, seq_lens[f], minutes) for f in freqs}
-
-    def align(per):
-        if len(freqs) == 1:
-            f = freqs[0]
-            return {f: np.arange(len(per[f].keys))}
-        sets = [set(map(tuple, per[f].keys.tolist())) for f in freqs]
-        common = set(sorted(set.intersection(*sets)))
-        out = {}
-        for f in freqs:
-            mask = np.fromiter((tuple(r) in common for r in per[f].keys.tolist()),
-                               dtype=bool, count=len(per[f].keys))
-            out[f] = np.where(mask)[0]
-        return out
-
-    tr_idx, va_idx = align(tr_per), align(va_per)
-
+    # ---- 训练集: 直接 fit 统计量 (不物化窗口), 再就地标准化 ----
+    tr = _accumulate(table, tr_m, freqs, seq_lens, minutes, stats=None)
+    if len(tr["keys"]) == 0:
+        raise RuntimeError(f"训练集无样本 (months={tr_m})")
     stats = {}
     for f in freqs:
-        stats[f] = _fit_scaler(tr_per[f].X[tr_idx[f]])
-    Xtr = [tr_per[f].X[tr_idx[f]] for f in freqs]
-    Xva = [va_per[f].X[va_idx[f]] for f in freqs]
-    for i, f in enumerate(freqs):
-        Xtr[i] = _apply_scaler(Xtr[i], *stats[f])
-        Xva[i] = _apply_scaler(Xva[i], *stats[f])
+        mean, std = _fit_scaler(tr["feats"][f])
+        _scale_feat(tr["feats"][f], mean, std)
+        stats[f] = (mean.astype("float32"), std.astype("float32"))
 
-    ytr = _rank_targets(tr_per[freqs[0]].y[tr_idx[freqs[0]]], tr_per[freqs[0]].keys[tr_idx[freqs[0]]])
-    yva_raw = va_per[freqs[0]].y[va_idx[freqs[0]]]
-    vkeys = va_per[freqs[0]].keys[va_idx[freqs[0]]]
+    # ---- 验证集: 复用训练统计量 (同口径 -> 无泄漏) ----
+    va = _accumulate(table, val_m, freqs, seq_lens, minutes, stats=stats)
+    if len(va["keys"]) == 0:
+        raise RuntimeError(f"验证集无样本 (months={val_m})")
+    print(f"  [data] train_N={len(tr['keys']):,} val_N={len(va['keys']):,}")
+
+    ytr = _rank_targets(tr["y"], tr["keys"])
+    yva_raw = va["y"]
+    vkeys = va["keys"]
 
     model_cfg = dict(arch="multi" if len(freqs) > 1 else "single",
                      freqs=list(freqs), **CFG.MODEL_CFG)
@@ -700,9 +1059,11 @@ def _train_freqs(df1m, freqs, seq_lens, minutes, seed=SEED, epochs=None, lr=None
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, factor=tc["lr_factor"], patience=tc["lr_patience"])
 
-    Xtr_t = [torch.from_numpy(np.ascontiguousarray(x)) for x in Xtr]
+    n = len(ytr)
     ytr_t = torch.from_numpy(ytr)
-    n = len(ytr_t)
+    buf = {f: np.empty((batch, int(seq_lens[f]), N_FEATURES), "float32")
+           for f in freqs}
+    grad_clip = float(tc.get("grad_clip", 1.0))
     best, best_state, bad = -9e9, None, 0
 
     for ep in range(epochs):
@@ -710,8 +1071,10 @@ def _train_freqs(df1m, freqs, seq_lens, minutes, seed=SEED, epochs=None, lr=None
         perm = torch.randperm(n)
         tot = 0.0; nb = 0
         for s in range(0, n, batch):
-            idxb = perm[s:s + batch]
-            xb = [t[idxb].to(device) for t in Xtr_t]
+            idxb = perm[s:s + batch].numpy()
+            xs = _batch_windows(tr["feats"], tr["anchors"], idxb, seq_lens,
+                                freqs, buf=buf)
+            xb = [torch.from_numpy(x).to(device) for x in xs]
             yb = ytr_t[idxb].to(device)
             opt.zero_grad()
             p = model(xb)
@@ -719,11 +1082,12 @@ def _train_freqs(df1m, freqs, seq_lens, minutes, seed=SEED, epochs=None, lr=None
             corr = (pc * yc).sum() / (torch.sqrt((pc ** 2).sum() * (yc ** 2).sum()) + 1e-8)
             loss = 1.0 - corr
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
             tot += float(loss); nb += 1
 
-        ic = _eval_ic(model, Xva, yva_raw, vkeys, device)
+        ic = _eval_ic(model, va["feats"], va["anchors"], seq_lens,
+                      yva_raw, vkeys, freqs, device)
         sched.step(-ic)
         print(f"  ep{ep+1:02d} loss={tot/max(nb,1):.4f} val_IC={ic:+.4f}")
         if ic > best:
@@ -738,19 +1102,22 @@ def _train_freqs(df1m, freqs, seq_lens, minutes, seed=SEED, epochs=None, lr=None
         model.load_state_dict(best_state)
     model.eval()
     print(f"  best val_IC={best:+.4f}")
+    del tr, va
+    gc.collect()
     return model, stats, model_cfg
 
 
 @torch.no_grad()
-def _eval_ic(model, X, y, keys, device, batch=4096):
+def _eval_ic(model, feats, anchors, seq_lens, y, keys, freqs, device, batch=4096):
+    """验证集截面 IC: 窗口按 batch 现场 gather, 不预物化 [N, T, F]。"""
     model.eval()
-    Xt = [torch.from_numpy(np.ascontiguousarray(x)) for x in X]
-    preds = []
-    for s in range(0, len(y), batch):
-        xb = [t[s:s + batch].to(device) for t in Xt]
-        preds.append(model(xb).cpu().numpy())
-    preds = np.concatenate(preds) if preds else np.zeros(0)
-    # 截面 IC(仅用有标签的样本)
+    n = len(y)
+    preds = np.empty(n, "float32")
+    for s in range(0, n, batch):
+        idxb = np.arange(s, min(s + batch, n))
+        xs = _batch_windows(feats, anchors, idxb, seq_lens, freqs)
+        xb = [torch.from_numpy(x).to(device) for x in xs]
+        preds[s:s + len(idxb)] = model(xb).cpu().numpy().reshape(-1)
     m = np.isfinite(y)
     if m.sum() < 10:
         return 0.0
@@ -771,21 +1138,23 @@ def train_and_save(datasources, train_months=None, freqs=None,
 
     train_months: 训练月份列表; 默认 config.TRAIN_MONTHS (2020-01 .. 2023-12)。
     freqs:        参与建模的频率; 默认 config.FREQS。
+
+    内存: 数据全程按月流式, 不物化滑窗矩阵; 峰值由 "一个月的 bar1m + 各频率
+    特征矩阵" 决定, 远低于平台 51200MB 硬限制。
     """
     if train_months is None:
         train_months = CFG.TRAIN_MONTHS
     if freqs is None:
         freqs = CFG.FREQS
+    train_months = sorted(str(m) for m in train_months)
 
     table = datasources["bar1m"]
-    print(f"[train] 读取 {len(train_months)} 个月 bar1m ... seed={SEED}")
-    df1m = _load_range(table, train_months)
-    print(f"[train] 行数={len(df1m):,} 交易日={df1m['day'].nunique()}")
+    print(f"[train] 分月流式读取 {len(train_months)} 个月 bar1m ... seed={SEED}")
 
     # 各频率输入窗口 bar 数 = LOOKBACK_MINUTES / bar 长度
     seq_lens = {f: max(1, CFG.LOOKBACK_MINUTES // FREQ_MINUTES[f]) for f in freqs}
     model, stats, model_cfg = _train_freqs(
-        df1m, list(freqs), seq_lens, ALIGNED_MINUTES, seed=SEED)
+        table, train_months, list(freqs), seq_lens, ALIGNED_MINUTES, seed=SEED)
 
     payload = {
         "format": "miniquant-transformer-v1",
@@ -802,7 +1171,7 @@ def train_and_save(datasources, train_months=None, freqs=None,
         "train_cfg": dict(CFG.TRAIN_CFG),
         "lookback_minutes": int(CFG.LOOKBACK_MINUTES),
         "horizon_minutes": int(CFG.HORIZON_MINUTES),
-        "sort_key": 1,           # resample/make_samples 已按时间排序
+        "sort_key": 1,           # resample/make_anchors 已按时间排序
         "state_dict": {k: v for k, v in model.state_dict().items()},
     }
     save_model(model_path, payload)

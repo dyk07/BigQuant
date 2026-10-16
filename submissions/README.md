@@ -40,11 +40,11 @@
 
 ```
 <包名>/
-  Transformer_modelsave_train.py     # 训练脚本 (数据 + 模型 + 训练循环, 单一事实来源)
-  Transformer_modelsave_predict.py   # 推理脚本 (main 的原型)
-  config.py                          # 超参数配置 + 随机种子
-  requirements.txt                   # 依赖声明
-  transformer_model.json             # 已训练模型权重
+  Transformer_modelsave_train.py       # 训练脚本 (数据 + 模型 + 训练循环, 单一事实来源)
+  Transformer_modelsave_predict.py     # 推理脚本 (main 的原型)
+  config.py                            # 超参数配置 + 随机种子
+  requirements.txt                     # 依赖声明
+  transformer_model.json               # 已训练模型权重
   Transformer_modelsave_predict.ipynb  # 由上述源文件生成的单 notebook 提交物
 ```
 
@@ -68,6 +68,17 @@
 - **无未来数据**: 输入窗口严格在决策时刻之前; 标签窗口严格在决策时刻之后且不跨交易日。
 - **预处理一致性**: 标准化统计随权重落盘, 推理直接复用, 杜绝 train/infer 漂移。
 - **数据读取带日期过滤**: 只查询 `[start_date - 10 天, end_date]`, 避免整表读入内存。
+- **内存策略 (私榜 51200MB 限制)**: 私榜会在隔离环境用 `train_and_save` 从零重训
+  (默认 48 个月)。为避免被平台按 51200MB 强制终止, 全流程按"按月流式"设计:
+  - `_fetch_table` 对字符串表名走 `dai.query(..., filters={"date": [月首, 月末]})`,
+    由平台**服务端**只回传当月数据; DataFrame / 表对象入参一律经 `_pick_cols` 先做
+    日期掩码 `[start-10天, end+10天]` 再裁剪列, 杜绝"整表反复读入"。
+  - `resample_bars` 只保留原表视图 + 极小拍卖切片 + 纯 numpy 分桶数组, 不再复制整表;
+    实测 1 个月 5.41GB 峰值降到 3.69GB。**分桶必须用向上取整** (`(x + K - 1) // K`),
+    否则会多出 09:30 / 13:00 两个空桶 (与原生 bar5m/15m/30m 不再逐位一致)。
+  - `_accumulate` 逐月累积特征矩阵 (每月约 114MB), 训练 step 用 `_batch_windows`
+    按 batch 现场 gather (~50MB), 不物化 `[N, T, F]` 全量窗口张量。
+  - 实测 48 个月 train+val 同时在内存时仍远低于 51200MB (见 `_tools/full_mem.py`)。
 - **合规**: 只用基础算子 (单位还原 / 量纲统一 / 对数变换 / 缺失值处理), 不做任何手工因子
   (滚动统计、买卖量不平衡、量价组合等一律不构造)。
 
@@ -94,3 +105,9 @@
 - `build_notebook.py` — 把每个包的源文件打包成**单个 notebook**。
 - `verify_notebook.py` — 顺序执行 notebook 全部单元格并调用 `main()`, 验证输出格式。
 - `verify_submission.py` — 用提交侧代码走完整推理链路, 在本地 feather 上复算 2024H2 IC 对拍。
+- `ab_resample.py` / `dbg_resample.py` — 重采样**逐位一致性**对拍 (与原生 bar5m/15m/30m),
+  防止分桶取整方式被改坏 (floor/ceil 之差会引入 09:30 / 13:00 空桶)。
+- `mem_trace.py` / `full_mem.py` / `full_mem_trend.py` — 逐阶段 / 全量 / 逐月内存曲线,
+  用于确认私榜 48 个月重训不会触达 51200MB 强制终止线。
+- `smoke_train.py` — 用小月份区间跑通 `train_and_save` 全链路 (含假 `dai`)。
+- `verify_all.sh` — 依次执行三个包的 notebook 并汇总输出格式校验。

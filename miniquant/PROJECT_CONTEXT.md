@@ -93,6 +93,27 @@ miniquant/
 - [ ] 测试集评估（2024H2）
 - [ ] 多频率融合、排序损失、盘口增强
 
+## 7. 提交包内存设计（平台硬限制）
+平台会议 / 答疑结论：**公榜（评测）容器内存上限 51200MB，私榜重训上限 30GB + 3h**，
+超限**强制终止**。因此提交包必须全程低常驻、低尖峰。
+
+`submissions/*/Transformer_modelsave_train.py` 采用的策略：
+1. **只 SELECT 需要的 28 列**（`NEEDED_COLS`），并在 `_pick_cols` 里 `_shrink`
+   到最小 dtype（OHLC/盘口价格 int32、volume/amount int64 保留、其余按需）；
+2. **按自然月分块读取**（`_build_month`）：读一块 → 建特征/标签 → `del raw, per`
+   → `gc.collect()` → `_trim()`；
+3. **不物化 `[N,T,25]` 滑窗张量**：只保留 `(特征矩阵, 锚点下标)`，窗口在
+   `_batch_windows` 中**按 batch 现场 gather**（峰值 O(batch·T·F)）；
+4. 标准化为逐列仿射，作用于**特征矩阵**一次，与逐窗口等价但内存降为 `1/T`；
+5. 累积出的月特征矩阵用 **`_concat_inplace`** 合并（先分配结果、逐块就地拷入
+   并立即释放源块），取代 `np.concatenate`（拼接瞬间 ≈ 2× 结果）的瞬时尖峰；
+6. 每月末调用 **`_trim()`**（`malloc_trim(0)`）把 glibc 空闲 arena 归还内核，
+   实测常驻 RSS 由 ~4.2GB 降到 ~2.3–3.0GB。
+
+本地实测（`_tools/verify_all.sh`，单月 `main` 评测路径）：
+`Maximum resident set size` = 4242432 / 4305668 / 4351412 kbytes（1f/2f/3f），
+远低于 51200MB 公榜限制。
+
 ## 7. 关键规则
 - 标准化统计量只用训练集
 - 按时间切分，不能随机切分

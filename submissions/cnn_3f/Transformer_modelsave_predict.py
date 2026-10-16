@@ -24,6 +24,7 @@
 **只依赖 1 分钟 K 线**: 模型需要的 5/15/30 分钟视角在 `build_dataset` 内部由
 bar1m 重采样得到, 与原生多频数据数值逐位一致。
 """
+import gc
 import os
 
 import numpy as np
@@ -34,6 +35,7 @@ import structlog
 
 from Transformer_modelsave_train import (
     MODEL_PATH, BATCH, build_model, build_dataset, load_model, train_and_save,
+    _iter_dataset,
 )
 
 logger = structlog.get_logger()
@@ -64,28 +66,44 @@ def main(datasources, start_date, end_date):
     model.eval()
     logger.info("已加载模型", path=MODEL_PATH, freqs=freqs, device=str(device))
 
-    # ---------- 推理 (样本外测试区间) ----------
-    logger.info("构建测试集并预测", start=str(start_date), end=str(end_date))
-    Xs, _, idx_df, _ = build_dataset(
-        table, start_date, end_date, "infer",
-        ckpt["aligned_minutes"], stats, freqs=freqs, seq_lens=seq_lens)
-
-    Xt = [torch.from_numpy(np.ascontiguousarray(x)) for x in Xs]
-    preds = []
+    # ---------- 推理 (逐月流式, 峰值内存 ~1 个月) ----------
+    logger.info("逐月构建测试集并预测", start=str(start_date), end=str(end_date))
+    parts = []
+    n_rows = 0
     with torch.no_grad():
-        for i in range(0, len(idx_df), BATCH):
-            xb = [t[i:i + BATCH].to(device) for t in Xt]
-            preds.append(model(xb).cpu().numpy())
-    idx_df["factor"] = (np.concatenate(preds).astype(np.float64)
-                        if preds else np.zeros(len(idx_df)))
+        for Xs, _, idx_df, _ in _iter_dataset(
+                table, start_date, end_date, "infer",
+                ckpt["aligned_minutes"], stats, freqs=freqs, seq_lens=seq_lens):
+            if len(idx_df) == 0:
+                continue
+            Xt = [torch.from_numpy(np.ascontiguousarray(x)) for x in Xs]
+            preds = []
+            for i in range(0, len(idx_df), BATCH):
+                xb = [t[i:i + BATCH].to(device) for t in Xt]
+                preds.append(model(xb).cpu().numpy())
+            out = idx_df.copy()
+            out["factor"] = (np.concatenate(preds).astype(np.float64)
+                             if preds else np.zeros(len(out)))
+            parts.append(out)
+            n_rows += len(out)
+            del Xs, Xt, preds, idx_df
+            gc.collect()
+    if parts:
+        pred_df = pd.concat(parts, ignore_index=True)
+    else:
+        pred_df = pd.DataFrame({"date": [], "instrument": [], "minute_of_day": [],
+                                "factor": []})
+    logger.info("推理完成", rows=n_rows)
+    del parts
+    gc.collect()
 
     # ---------- 对齐中证 1000 + 规范输出 ----------
     stk = dai.query("SELECT date, instrument FROM cpt_jyc_2026_instruments",
                     filters={"date": [start_date, end_date]}).df()
-    # build_dataset 已按比赛的 8 个日内截面生成预测, 必须按完整时间精确对齐。
-    idx_df["date"] = pd.to_datetime(idx_df["date"])
+    # 逐月预测已按比赛的 8 个日内截面生成, 必须按完整时间精确对齐。
+    pred_df["date"] = pd.to_datetime(pred_df["date"])
     stk["date"] = pd.to_datetime(stk["date"])
-    result = (pd.merge(stk, idx_df, on=["date", "instrument"], how="inner")
+    result = (pd.merge(stk, pred_df, on=["date", "instrument"], how="inner")
                 .replace([np.inf, -np.inf], np.nan).dropna(subset=["factor"])
                 .drop_duplicates(["date", "instrument"])[["date", "instrument", "factor"]]
                 .sort_values(["date", "instrument"])

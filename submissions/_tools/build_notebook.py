@@ -38,7 +38,8 @@ if RUN_LOCAL_DEMO:
     M.jyc_eval._latest(factor_data=factor_data, show=True)
 '''
 
-PLATFORM_IMPORTS = '''import os
+PLATFORM_IMPORTS = '''import gc
+import os
 import numpy as np
 import pandas as pd
 import torch
