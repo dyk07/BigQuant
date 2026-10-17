@@ -102,7 +102,10 @@ class AttentionPooling(nn.Module):
 class CrossSectionAttention(nn.Module):
     """截面自注意力：同截面内一只股票 attend 到其余股票。
 
-    输入 [N, D]（一个截面的池化表示），输出 [N, D]（上下文增强后）。
+    输入 [N, D]（一个大 batch 的池化表示），可选 sec_ids [N]（全局截面编号）。
+    当给定 sec_ids 时，用 block-diagonal mask 限制注意力只在同截面内，
+    使一个 batch 可同时包含多个截面（跨截面分组）。
+
     对 N 维置换等变，不引入 per-instrument embedding，避免记住股票身份、
     在测试集新股票上泛化变差。
     """
@@ -123,10 +126,22 @@ class CrossSectionAttention(nn.Module):
                 "norm2": nn.LayerNorm(dim),
             }))
 
-    def forward(self, z):                    # [N, D]
+    @staticmethod
+    def _section_mask(sec_ids, device):
+        """构造 [N, N] bool mask：True 表示允许 attend（同截面）。
+
+        sec_ids: [N] 全局截面编号。同编号可 attend，跨编号屏蔽。
+        """
+        same = sec_ids[:, None] == sec_ids[None, :]     # [N, N]
+        return same.to(device)
+
+    def forward(self, z, sec_ids=None):      # [N, D]
+        mask = None
+        if sec_ids is not None:
+            mask = self._section_mask(sec_ids, z.device)
         z = z.unsqueeze(0)                   # [1, N, D]（1 = 截面这一维）
         for block in self.blocks:
-            a, _ = block["attn"](z, z, z, need_weights=False)
+            a, _ = block["attn"](z, z, z, attn_mask=mask, need_weights=False)
             z = block["norm1"](z + a)
             z = block["norm2"](z + block["ffn"](z))
         return z.squeeze(0)                  # [N, D]
@@ -239,12 +254,12 @@ class CNNTransformerModel(nn.Module):
             nn.Linear(head_dim, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, 25]
+    def forward(self, x: torch.Tensor, sec_ids=None) -> torch.Tensor:
+        # x: [B, T, 25]；sec_ids: [B] 可选，截面分组时提供（用于分组注意力）
         h = self.encoder(x)   # [B, T, hidden_dim]
         z = self.pool(h)      # [B, 2*hidden_dim]
         if self.xsec is not None:
-            z = torch.cat([z, self.xsec(z)], dim=-1)  # 残差式拼接
+            z = torch.cat([z, self.xsec(z, sec_ids=sec_ids)], dim=-1)  # 残差拼接
         return self.head(z).squeeze(-1)  # [B]
 
 

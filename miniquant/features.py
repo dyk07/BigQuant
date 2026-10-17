@@ -69,15 +69,15 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_labels(df: pd.DataFrame, horizon_bars: int = 1) -> pd.DataFrame:
     """
-    标签：未来 horizon_bars 根 bar 的 VWAP 收益（严格按平台会议定义）。
+    标签：未来 horizon_bars 根 bar 的 VWAP 收益（严格按平台定义）。
 
         future_vwap = sum(amount[t+1 .. t+h]) / sum(volume[t+1 .. t+h])
         end_price   = close[t+h]        # 未来窗口最后一根 bar 的收盘价
-        label       = future_vwap / end_price - 1
+        label       = end_price / future_vwap - 1      # 平台口径 vwap_return
 
-    end_price 用的是"未来窗口最后一根 bar 的 close"（= 最终一笔成交价），
-    而不是当前 bar 的 close[t]。实测两种分母算出的标签 Spearman ≈ -0.38
-    （排序都不一样，不只是量纲差异），必须按平台定义来。
+    平台答疑确认 vwap_return = **end_price / vwap - 1**（不是 vwap/end_price-1）。
+    两者对小幅收益近似互为相反数，方向反了会导致因子 IC 整体翻负。
+    end_price 用"未来窗口最后一根 bar 的 close"（= 最终一笔成交价）。
 
     约束：
     - 窗口不跨交易日（按 instrument_id + day 分组）
@@ -116,10 +116,9 @@ def build_labels(df: pd.DataFrame, horizon_bars: int = 1) -> pd.DataFrame:
     end_price = df["close"].astype("float64").groupby(
         grp, sort=False).shift(-h)
 
-    close = df["close"].to_numpy(dtype="float64")
     end_arr = end_price.to_numpy(dtype="float64")
-    label = np.where((close > 0) & (end_arr > 0),
-                     fwd_vwap / np.where(end_arr > 0, end_arr, 1.0) - 1.0,
+    label = np.where((fwd_vwap > 0) & (end_arr > 0),
+                     end_arr / np.where(fwd_vwap > 0, fwd_vwap, 1.0) - 1.0,
                      np.nan)
 
     df["future_vwap"] = fwd_vwap

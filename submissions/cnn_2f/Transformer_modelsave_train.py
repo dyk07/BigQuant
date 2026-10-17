@@ -236,32 +236,87 @@ class CNNTransformerEncoder(nn.Module):
         return self.out_norm(x)
 
 
+class CrossSectionAttention(nn.Module):
+    """截面自注意力: 同截面内一只股票 attend 到其余股票。
+
+    输入 [N, D]（一个大 batch 的融合表示），可选 sec_ids [N]（全局截面编号）。
+    当给定 sec_ids 时用 block-diagonal mask 限制注意力只在同截面内, 使一个
+    batch 可同时包含多个截面（随机大 batch 下也保持截面语义正确）。
+
+    对 N 维置换等变, 不引入 per-instrument embedding, 避免记住股票身份、
+    在测试集新股票上泛化变差。
+    """
+
+    def __init__(self, dim, heads=4, layers=1, dropout=0.1):
+        super().__init__()
+        self.blocks = nn.ModuleList()
+        for _ in range(layers):
+            self.blocks.append(nn.ModuleDict({
+                "attn": nn.MultiheadAttention(dim, heads, dropout=dropout,
+                                              batch_first=True),
+                "norm1": nn.LayerNorm(dim),
+                "ffn": nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(),
+                                     nn.Linear(dim * 4, dim)),
+                "norm2": nn.LayerNorm(dim),
+            }))
+
+    @staticmethod
+    def _section_mask(sec_ids, device):
+        """[N, N] bool mask: True 表示允许 attend（同截面）。"""
+        return (sec_ids[:, None] == sec_ids[None, :]).to(device)
+
+    def forward(self, z, sec_ids=None):           # [N, D]
+        mask = None
+        if sec_ids is not None:
+            mask = self._section_mask(sec_ids, z.device)
+        z = z.unsqueeze(0)                         # [1, N, D]
+        for block in self.blocks:
+            a, _ = block["attn"](z, z, z, attn_mask=mask, need_weights=False)
+            z = block["norm1"](z + a)
+            z = block["norm2"](z + block["ffn"](z))
+        return z.squeeze(0)                        # [N, D]
+
+
 class StockTransformer(nn.Module):
-    """单频模型: Encoder -> Pool -> Head -> scalar。forward(x:[B,T,25])->[B]。"""
+    """单频模型: Encoder -> Pool -> (可选截面注意力) -> Head -> scalar。
+    forward(x:[B,T,25] 或 list, sec_ids=None)->[B]。"""
 
     def __init__(self, in_dim=N_FEATURES, hidden=64, conv_blocks=3, kernel=3,
-                 transformer_layers=2, heads=4, dropout=0.1, fused_dim=64):
+                 transformer_layers=2, heads=4, dropout=0.1, fused_dim=64,
+                 use_xsec=False, xsec_layers=1, xsec_heads=4):
         super().__init__()
         self.encoder = CNNTransformerEncoder(
             in_dim, hidden, conv_blocks, kernel, 1, transformer_layers, heads, dropout)
         self.pool = AttentionPooling(hidden)
+        self.use_xsec = use_xsec
+        if use_xsec:
+            self.xsec = CrossSectionAttention(self.pool.out_dim, heads=xsec_heads,
+                                              layers=xsec_layers, dropout=dropout)
+            head_in = self.pool.out_dim * 2
+        else:
+            self.xsec = None
+            head_in = self.pool.out_dim
         self.head = nn.Sequential(
-            nn.Dropout(dropout), nn.Linear(self.pool.out_dim, fused_dim),
+            nn.Dropout(dropout), nn.Linear(head_in, fused_dim),
             nn.ReLU(), nn.Dropout(dropout), nn.Linear(fused_dim, 1))
 
-    def forward(self, x):
+    def forward(self, x, sec_ids=None):
         # 兼容主入口统一传入 list(多频分支); 单频取第 0 项
         if isinstance(x, (list, tuple)):
             x = x[0]
-        return self.head(self.pool(self.encoder(x))).squeeze(-1)
+        z = self.pool(self.encoder(x))
+        if self.xsec is not None:
+            z = torch.cat([z, self.xsec(z, sec_ids=sec_ids)], dim=-1)
+        return self.head(z).squeeze(-1)
 
 
 class StockTransformerMF(nn.Module):
-    """多频模型: 每频一条 CNN+Transformer 分支, 拼接后残差 head。
-    forward(xs:list[[B,T_f,25]])->[B]。"""
+    """多频模型: 每频一条 CNN+Transformer 分支, 拼接后残差 head;
+    融合表示上可选截面交叉注意力。forward(xs, sec_ids=None)->[B]。"""
 
     def __init__(self, freqs, in_dim=N_FEATURES, hidden=64, conv_blocks=3, kernel=3,
-                 transformer_layers=2, heads=4, dropout=0.1, fused_dim=64):
+                 transformer_layers=2, heads=4, dropout=0.1, fused_dim=64,
+                 use_xsec=False, xsec_layers=1, xsec_heads=4):
         super().__init__()
         self.freqs = list(freqs)
         self.branch = nn.ModuleDict()
@@ -273,19 +328,37 @@ class StockTransformerMF(nn.Module):
         d = len(self.freqs) * 2 * hidden
         self.fuse = nn.Sequential(nn.Linear(d, fused_dim), nn.ReLU(),
                                   nn.LayerNorm(fused_dim))
+        self.use_xsec = use_xsec
+        if use_xsec:
+            self.xsec = CrossSectionAttention(fused_dim, heads=xsec_heads,
+                                              layers=xsec_layers, dropout=dropout)
+            # 融合表示 z ‖ 截面上下文 z_ctx ‖ 多频原始 h
+            head_in = fused_dim * 2 + d
+        else:
+            self.xsec = None
+            head_in = fused_dim + d
         self.head = nn.Sequential(
-            nn.Dropout(dropout), nn.Linear(fused_dim + d, fused_dim),
+            nn.Dropout(dropout), nn.Linear(head_in, fused_dim),
             nn.ReLU(), nn.Dropout(dropout), nn.Linear(fused_dim, 1))
 
-    def forward(self, xs):
+    def forward(self, xs, sec_ids=None):
         parts = [self.pool[f](self.branch[f](xs[k])) for k, f in enumerate(self.freqs)]
-        h = torch.cat(parts, dim=-1)
-        return self.head(torch.cat([self.fuse(h), h], dim=-1)).squeeze(-1)
+        h = torch.cat(parts, dim=-1)            # [B, d]
+        z = self.fuse(h)                        # [B, fused_dim]
+        if self.xsec is not None:
+            z = torch.cat([z, self.xsec(z, sec_ids=sec_ids), h], dim=-1)
+        else:
+            z = torch.cat([z, h], dim=-1)
+        return self.head(z).squeeze(-1)
 
 
 def build_model(model_cfg):
     """按 model_cfg 构造模型(arch='single'|'multi')。"""
     kw = {k: v for k, v in model_cfg.items() if k not in ("arch", "freqs")}
+    # 优先用 model_cfg 里显式记录的开关 (checkpoint 自描述), 否则回落到 CFG。
+    kw["use_xsec"] = bool(model_cfg.get("use_xsec", getattr(CFG, "USE_XSEC", False)))
+    kw["xsec_layers"] = int(model_cfg.get("xsec_layers", getattr(CFG, "XSEC_LAYERS", 1)))
+    kw["xsec_heads"] = int(model_cfg.get("xsec_heads", getattr(CFG, "XSEC_HEADS", 4)))
     if model_cfg["arch"] == "multi":
         return StockTransformerMF(freqs=model_cfg["freqs"], **kw)
     return StockTransformer(**kw)
@@ -611,7 +684,12 @@ def build_features(df):
 
 
 def build_labels(df, horizon_bars):
-    """标签 = future_vwap / close[t+h] - 1, 窗口不跨交易日 (float32)。"""
+    """标签 = end_price / future_vwap - 1, 窗口不跨交易日 (float32)。
+
+    平台 vwap_return 的真实定义是 **end_price / vwap - 1**(会议答疑确认:
+    "endprice / vwap - 1")。之前误写成 vwap / end_price - 1, 对小幅收益两者
+    近似互为相反数 -> 因子方向整体翻负(IC 全负)。这里改为平台口径。
+    """
     grp = [df["instrument_id"], df["day"]]
     amt64 = df["amount"].astype("float64")
     vol64 = df["volume"].astype("float64")
@@ -621,10 +699,9 @@ def build_labels(df, horizon_bars):
     fwd_vol = c_vol.groupby(grp, sort=False).shift(-horizon_bars) - c_vol
     fwd_vwap = np.where(fwd_vol > 0, fwd_amt / fwd_vol, np.nan)
     end = df["close"].astype("float64").groupby(grp, sort=False).shift(-horizon_bars)
-    close = df["close"].to_numpy(dtype="float64")
     end_a = end.to_numpy(dtype="float64")
-    lab = np.where((close > 0) & (end_a > 0),
-                   fwd_vwap / np.where(end_a > 0, end_a, 1.0) - 1.0, np.nan)
+    lab = np.where((fwd_vwap > 0) & (end_a > 0),
+                   end_a / np.where(fwd_vwap > 0, fwd_vwap, 1.0) - 1.0, np.nan)
     return lab.astype("float32")
 
 
@@ -902,6 +979,56 @@ def _rank_targets(y, keys):
     return out
 
 
+def _corr_batch(p, y):
+    """batch 内 Pearson 相关 (中心化后余弦), 返回标量 corr ∈ [-1, 1]。
+
+    注意: eps 放在 sqrt **内部**, 否则当 p/y 均为常数 (方差=0) 时,
+    sqrt(0) 的反向会得到 inf*0 = NaN 梯度 (如换手正则的单元素配对)。
+    """
+    pc = p - p.mean(); yc = y - y.mean()
+    denom = torch.sqrt((pc ** 2).sum() * (yc ** 2).sum() + 1e-8)
+    return (pc * yc).sum() / denom
+
+
+def _section_ids(keys):
+    """把 (day, minute) 映射为截面编号 [N] int (0..K-1)。
+
+    用于截面交叉注意力的 block-diagonal mask: 编号只参与相等比较,
+    因此用 day*1440 + mod 的整数哈希即可, 无需额外的连续映射开销。
+    返回 int64 数组, 随机 batch 下按全局下标切片即可还原截面身份。
+    """
+    if len(keys) == 0:
+        return np.zeros(0, "int64")
+    sec = keys[:, 1].astype("int64") * 1440 + keys[:, 2].astype("int64")
+    _, ids = np.unique(sec, return_inverse=True)
+    return ids.astype("int64")
+
+
+def _turnover_next(keys):
+    """返回 next_idx [N]: 样本 i 的下一个同 (instrument, day) 截面下标, 无则 -1。
+
+    换手正则用: 相邻截面是"同一只股票在同一交易日的下一采样时刻"。用
+    (instrument, day, mod) 的字典序定位同 (instrument, day) 块内 mod 升序的
+    后继行。与输入 keys 是否已排序无关 (内部 lexsort 一次, 代价 O(N log N),
+    整个训练周期仅算一次)。
+    """
+    n = len(keys)
+    next_idx = np.full(n, -1, "int64")
+    if n < 2:
+        return next_idx
+    order = np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
+    k = keys[order]
+    same = (k[1:, 0] == k[:-1, 0]) & (k[1:, 1] == k[:-1, 1])
+    valid = same & (k[1:, 2] != k[:-1, 2])      # 同截面自身不配对
+    nxt_sorted = np.full(n, -1, "int64")
+    nxt_sorted[np.arange(0, n - 1)[valid]] = np.arange(1, n)[valid]
+    inv = np.empty(n, "int64")
+    inv[order] = np.arange(n)
+    m = nxt_sorted >= 0
+    next_idx[order[m]] = order[nxt_sorted[m]]
+    return next_idx
+
+
 def clip_bounds(labels, lo=0.01, hi=0.99):
     x = labels[np.isfinite(labels)]
     if x.size == 0:
@@ -1102,7 +1229,10 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
     vkeys = va["keys"]
 
     model_cfg = dict(arch="multi" if len(freqs) > 1 else "single",
-                     freqs=list(freqs), **CFG.MODEL_CFG)
+                     freqs=list(freqs), **CFG.MODEL_CFG,
+                     use_xsec=bool(getattr(CFG, "USE_XSEC", False)),
+                     xsec_layers=int(getattr(CFG, "XSEC_LAYERS", 1)),
+                     xsec_heads=int(getattr(CFG, "XSEC_HEADS", 4)))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(model_cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -1114,23 +1244,91 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
     buf = {f: np.empty((batch, int(seq_lens[f]), N_FEATURES), "float32")
            for f in freqs}
     grad_clip = float(tc.get("grad_clip", 1.0))
+
+    use_xsec = bool(getattr(CFG, "USE_XSEC", False))
+    use_turnover = bool(getattr(CFG, "USE_TURNOVER", False))
+    lam_to = float(getattr(CFG, "LAMBDA_TURNOVER", 0.01))
+
+    # 截面编号 (训练周期仅算一次)
+    sec_ids_tr = _section_ids(tr["keys"]) if use_xsec else None
+
+    # 换手"下一截面"配对 (全局下标, 仅算一次): cur -> 同 (instrument, day) 的
+    # 下一采样截面。随机 batch 会打散, 只有 cur 与 next 落在同一 batch 时才能
+    # 直接算平滑相关; 该配对在 epoch 开始时按 perm 位置预先归类, 避免逐 batch
+    # 做 O(n) 成员判断。
+    cur_tr = nxt_tr = None
+    if use_turnover:
+        nxt_all = _turnover_next(tr["keys"])
+        valid = nxt_all >= 0
+        cur_tr = np.where(valid)[0].astype("int64")
+        nxt_tr = nxt_all[valid].astype("int64")
+        del nxt_all, valid
+
     best, best_state, bad = -9e9, None, 0
 
     for ep in range(epochs):
         model.train()
         perm = torch.randperm(n)
+        perm_np = perm.numpy()
         tot = 0.0; nb = 0
+        tot_to = 0.0; cnt_to = 0
+
+        # 换手: 按本 epoch 的随机排列, 找出"cur 与 next 落在同一 batch"的配对,
+        # 记录其 batch 起始下标 s 与该 batch 内的局部下标 (lcur, lnxt)。
+        pair_by_s = None
+        if use_turnover and cur_tr is not None:
+            pos = np.empty(n, "int64")
+            pos[perm_np] = np.arange(n)
+            bcur = pos[cur_tr] // batch
+            bnxt = pos[nxt_tr] // batch
+            same = bcur == bnxt
+            if same.any():
+                scur = pos[cur_tr[same]]
+                snxt = pos[nxt_tr[same]]
+                bs = (scur // batch) * batch
+                pair_by_s = {}
+                for s0, lc, ln in zip(bs, scur % batch, snxt % batch):
+                    pair_by_s.setdefault(int(s0), []).append((int(lc), int(ln)))
+            del pos
+
         for s in range(0, n, batch):
-            idxb = perm[s:s + batch].numpy()
+            idxb = perm_np[s:s + batch]
             xs = _batch_windows(tr["feats"], tr["anchors"], idxb, seq_lens,
                                 freqs, buf=buf)
             xb = [torch.from_numpy(x).to(device) for x in xs]
             yb = ytr_t[idxb].to(device)
+            sidb = None if sec_ids_tr is None else \
+                torch.from_numpy(sec_ids_tr[idxb]).to(device)
+
             opt.zero_grad()
-            p = model(xb)
-            pc = p - p.mean(); yc = yb - yb.mean()
-            corr = (pc * yc).sum() / (torch.sqrt((pc ** 2).sum() * (yc ** 2).sum()) + 1e-8)
-            loss = 1.0 - corr
+            p = model(xb, sec_ids=sidb)
+
+            # 主损失: 与评估截面 IC 对齐。启用截面注意力时改为"组内 corr 再平均",
+            # 避免随机大 batch 把多个截面混在一起做 Pearson 造成的偏差。
+            if use_xsec:
+                loss = 0.0
+                cnt = 0
+                for g in torch.unique(sidb):
+                    m = sidb == g
+                    if m.sum() < 2:
+                        continue
+                    loss = loss + (1.0 - _corr_batch(p[m], yb[m]))
+                    cnt += 1
+                loss = loss / max(cnt, 1) if cnt else (1.0 - _corr_batch(p, yb))
+            else:
+                loss = 1.0 - _corr_batch(p, yb)
+
+            # 换手正则: 1 - corr(p_cur, p_next), 同一股票相邻截面分数相关越高,
+            # 相对排序越稳定 -> 换手越低。
+            if pair_by_s and s in pair_by_s:
+                lcs = torch.tensor([a for a, _ in pair_by_s[s]], device=device)
+                lns = torch.tensor([b for _, b in pair_by_s[s]], device=device)
+                # 至少 2 对才构成有意义的时序相关 (单对退化为零方差 -> 无梯度)
+                if lcs.numel() >= 2:
+                    to_corr = _corr_batch(p[lcs], p[lns])
+                    loss = loss + lam_to * (1.0 - to_corr)
+                    tot_to += float(1.0 - to_corr); cnt_to += 1
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             opt.step()
@@ -1139,7 +1337,10 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
         ic = _eval_ic(model, va["feats"], va["anchors"], seq_lens,
                       yva_raw, vkeys, freqs, device)
         sched.step(-ic)
-        print(f"  ep{ep+1:02d} loss={tot/max(nb,1):.4f} val_IC={ic:+.4f}")
+        msg = f"  ep{ep+1:02d} loss={tot/max(nb,1):.4f} val_IC={ic:+.4f}"
+        if use_turnover:
+            msg += f" turnover={tot_to/max(cnt_to,1):.4f}"
+        print(msg)
         if ic > best:
             best, bad = ic, 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -1158,16 +1359,32 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
 
 
 @torch.no_grad()
-def _eval_ic(model, feats, anchors, seq_lens, y, keys, freqs, device, batch=4096):
-    """验证集截面 IC: 窗口按 batch 现场 gather, 不预物化 [N, T, F]。"""
+def _predict_all(model, feats, anchors, seq_lens, freqs, keys, device, batch=4096):
+    """全量前向: 窗口按 batch 现场 gather, 返回 np.float32[N] 预测分数。
+
+    截面注意力需要 sec_ids 才能保持"同截面内交互"语义, 因此这里按 keys
+    推导全局截面编号并逐 batch 传入; 未启用 xsec 时 sec_ids=None (等价原逻辑)。
+    """
     model.eval()
-    n = len(y)
+    n = len(keys)
     preds = np.empty(n, "float32")
+    use_xsec = bool(getattr(model, "use_xsec", False))
+    sec_ids = _section_ids(keys) if use_xsec else None
     for s in range(0, n, batch):
         idxb = np.arange(s, min(s + batch, n))
         xs = _batch_windows(feats, anchors, idxb, seq_lens, freqs)
         xb = [torch.from_numpy(x).to(device) for x in xs]
-        preds[s:s + len(idxb)] = model(xb).cpu().numpy().reshape(-1)
+        sidb = None if sec_ids is None else \
+            torch.from_numpy(sec_ids[idxb]).to(device)
+        preds[s:s + len(idxb)] = model(xb, sec_ids=sidb).cpu().numpy().reshape(-1)
+    return preds
+
+
+@torch.no_grad()
+def _eval_ic(model, feats, anchors, seq_lens, y, keys, freqs, device, batch=4096):
+    """验证集截面 IC: 窗口按 batch 现场 gather, 不预物化 [N, T, F]。"""
+    preds = _predict_all(model, feats, anchors, seq_lens, freqs, keys,
+                         device, batch=batch)
     m = np.isfinite(y)
     if m.sum() < 10:
         return 0.0
@@ -1219,6 +1436,9 @@ def train_and_save(datasources, train_months=None, freqs=None,
         "train_months": list(train_months),
         "seed": int(SEED),
         "train_cfg": dict(CFG.TRAIN_CFG),
+        "use_xsec": bool(getattr(CFG, "USE_XSEC", False)),
+        "use_turnover": bool(getattr(CFG, "USE_TURNOVER", False)),
+        "lambda_turnover": float(getattr(CFG, "LAMBDA_TURNOVER", 0.01)),
         "lookback_minutes": int(CFG.LOOKBACK_MINUTES),
         "horizon_minutes": int(CFG.HORIZON_MINUTES),
         "sort_key": 1,           # resample/make_anchors 已按时间排序

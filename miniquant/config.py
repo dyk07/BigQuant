@@ -109,6 +109,10 @@ class Config:
     xsec_layers: int = 1                    # 交叉注意力 Transformer 块数
     xsec_heads: int = 4                     # 交叉注意力头数
     accum_steps: int = 4                    # 截面 batch 模式下的梯度累积步数
+    # 大 batch 内跨截面分组：多个截面组成一个大 batch，注意力/损失按截面分组。
+    # 兼顾大 batch 梯度稳定性 + 截面上下文（隔离变量实验结论的落地）。
+    use_grouped_batch: bool = False         # 启用大 batch 跨截面分组
+    grouped_batch_size: int = 2048          # 每个大 batch 的目标股票数
 
     # ===== 训练 =====
     batch_size: int = 512

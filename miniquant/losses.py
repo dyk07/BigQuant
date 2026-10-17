@@ -38,6 +38,27 @@ def corr_loss(pred, target, **_):
     return 1.0 - _pearson(pred, target)
 
 
+def grouped_corr_loss(pred, target, sec_ids, **_):
+    """按截面分组求 soft-IC（1 - 组内 Pearson），再跨组平均。
+
+    用于大 batch 内多截面分组：损失与评估指标（逐截面 Spearman IC 平均）
+    严格对齐，同时保持大 batch 的梯度稳定性。
+    """
+    if pred.numel() < 2 or sec_ids is None:
+        return corr_loss(pred, target)
+    loss = 0.0
+    n_sec = 0
+    for g in torch.unique(sec_ids):
+        m = sec_ids == g
+        if m.sum() < 2:
+            continue
+        loss = loss + corr_loss(pred[m], target[m])
+        n_sec += 1
+    if n_sec == 0:
+        return corr_loss(pred, target)
+    return loss / n_sec
+
+
 def ic_loss(pred, target, **_):
     """1 - Spearman(pred, target)（batch 内先取秩）。"""
     if pred.numel() < 2:

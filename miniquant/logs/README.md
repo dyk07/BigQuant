@@ -13,8 +13,10 @@ logs/
 │   ├── mf_smoke.log          # v3 四频率融合 smoke
 │   ├── mf_compare.log        # v3 四频 vs 双频对照
 │   ├── full_cnn.log          # v4 CNN+Transformer
-│   ├── full_base_xsec_ab.log # xsec 实验 baseline（v5 对照）
-│   └── full_xsec_ab.log      # xsec 实验（v5 交叉注意力）
+│   ├── full_base_xsec_ab.log # xsec 实验 baseline（随机 batch 对照）
+│   ├── full_secbatch_ab.log  # xsec 实验：截面 batch（无注意力）
+│   ├── full_xsec_ab.log      # xsec 实验（截面 batch + 交叉注意力）
+│   └── full_grouped_ab.log   # xsec 实验（分组大 batch + 交叉注意力）
 └── <date>_<模型>.md          # 各版本模型记录（正式记录，纳入 git）
 ```
 
@@ -26,7 +28,7 @@ logs/
 | v2 | 2026-10-06 | GRU 双流（全量样本） | [2026-10-06_gru_bar30m_full2.md](./2026-10-06_gru_bar30m_full2.md) | 0.0394 |
 | v3 | 2026-10-06 | 多频率融合 GRU（multifreq） | [2026-10-06_multifreq.md](./2026-10-06_multifreq.md) | 0.0363（4 频） |
 | v4 | 2026-10-09 | CNN+Transformer（单频） | [2026-10-09_cnn_bar30m.md](./2026-10-09_cnn_bar30m.md) | 0.0473 |
-| v5 | 2026-10-17 | 截面交叉注意力 A/B（单频） | [2026-10-17_xsec_ab.md](./2026-10-17_xsec_ab.md) | 0.0426（xsec）/ 0.0477（baseline） |
+| v5 | 2026-10-17 | 截面交叉注意力 A/B（单频） | [2026-10-17_xsec_ab.md](./2026-10-17_xsec_ab.md) | 0.0477（随机）/ 0.0402（截面 batch）/ 0.0426（xsec）/ 0.0436（分组 xsec） |
 
 > 说明：各版本验证集口径不完全一致（采样截面数 / 样本数随配置演进有变化），
 > IC 数值只作趋势参考，不宜直接跨版本做严格排序比较；细节见各记录。
@@ -39,5 +41,7 @@ logs/
    且 bar1m 分支磁盘/内存开销巨大；需要更好的融合结构而非简单拼接。
 3. **CNN+Transformer 单频表现最佳**（IC≈0.047），且训练更快（全并行），是
    后续迭代的主攻方向。
-4. **截面交叉注意力（单频）暂未带来 IC 增益**（v5：xsec 0.0426 < baseline
-   0.0477），但 ICIR 略高；需在更强信号（多频）或更强注意力约束下再验证。
+4. **截面交叉注意力（单频）**：注意力模块本身有效（+0.0024、ICIR 显著改善），
+   单截面 batch 有害（−0.0075，梯度噪声）；分组大 batch 部分回收（+0.0010），
+   但净效果仍低于随机 batch baseline。**单频弱信号下梯度稳定性 > 损失对齐**，
+   截面注意力应转向多频（信号更强）验证（见 v5 记录）。

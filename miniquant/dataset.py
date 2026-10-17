@@ -151,11 +151,69 @@ def collate_sections(batch):
     return X, y, idx
 
 
+def section_ids(meta):
+    """为每个样本分配**全局**截面编号（0..K-1，同 day+minute 同编号）。
+
+    全局编号保证跨 batch 稳定，注意力 mask 用相等判断即可，无需局部连续编号。
+    """
+    keys = pd.MultiIndex.from_tuples([(m[1], m[2]) for m in meta])
+    codes, _ = pd.factorize(keys, sort=False)
+    return codes.astype(np.int64)
+
+
+def make_grouped_batches(meta, target_size=2048, min_stocks=10,
+                         shuffle=True, seed=42):
+    """把多个完整截面打包成一个大 batch（总股票数 ≈ target_size）。
+
+    返回 list[np.ndarray]，每个数组是一个大 batch 内样本的**全局下标**，
+    数组长度≈target_size（含 2~3 个完整截面）。截面归属由 StockDataset
+    持有的 section_ids 提供（见 collate_grouped）。
+
+    与 make_section_batches 的区别：单截面 batch 每个 batch 只含一个截面
+    （梯度噪声大）；这里多个截面拼大 batch，保留梯度稳定性，同时让
+    注意力/损失按截面分组。
+    """
+    gid = section_ids(meta)
+    df = pd.DataFrame({
+        "i": np.arange(len(meta), dtype=np.int64),
+        "g": gid,
+    })
+    sections = [g["i"].to_numpy() for _, g in df.groupby("g", sort=False)
+                if len(g) >= min_stocks]
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(sections)
+
+    batches = []
+    cur, cur_size = [], 0
+    for sec in sections:
+        cur.append(sec)
+        cur_size += len(sec)
+        if cur_size >= target_size:
+            batches.append(np.concatenate(cur))
+            cur, cur_size = [], 0
+    if cur:
+        batches.append(np.concatenate(cur))
+    return batches
+
+
+def collate_grouped(batch):
+    """大 batch 内多截面 [..., (X, y, idx, sec)] -> (X, y, idx, sec)。"""
+    X = torch.stack([b[0] for b in batch], dim=0)          # [n, T, F]
+    y = torch.stack([b[1] for b in batch], dim=0)          # [n]
+    idx = torch.tensor([b[2] for b in batch], dtype=torch.long)
+    sec = torch.stack([b[3] for b in batch])               # [n]（全局截面编号）
+    return X, y, idx, sec
+
+
 class StockDataset(Dataset):
-    def __init__(self, X, y, return_idx=False):
+    def __init__(self, X, y, return_idx=False, sec_ids=None):
         self.X = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32))
         self.y = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
         self.return_idx = return_idx
+        self.sec_ids = (torch.from_numpy(np.ascontiguousarray(sec_ids,
+                                                              dtype=np.int64))
+                        if sec_ids is not None else None)
 
     def __len__(self):
         return len(self.y)
@@ -163,5 +221,7 @@ class StockDataset(Dataset):
     def __getitem__(self, idx):
         if self.return_idx:
             # 返回全局下标，供截面采样后的 predict 按原顺序还原
+            if self.sec_ids is not None:
+                return self.X[idx], self.y[idx], idx, self.sec_ids[idx]
             return self.X[idx], self.y[idx], idx
         return self.X[idx], self.y[idx]

@@ -35,7 +35,7 @@ import structlog
 
 from Transformer_modelsave_train import (
     MODEL_PATH, BATCH, build_model, build_dataset, load_model, train_and_save,
-    _iter_dataset, _encode_instrument,
+    _iter_dataset, _encode_instrument, _section_ids,
 )
 
 logger = structlog.get_logger()
@@ -64,25 +64,35 @@ def main(datasources, start_date, end_date):
     model = build_model(ckpt["model_cfg"]).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
-    logger.info("已加载模型", path=MODEL_PATH, freqs=freqs, device=str(device))
+    use_xsec = bool(ckpt.get("model_cfg", {}).get("use_xsec", False))
+    logger.info("已加载模型", path=MODEL_PATH, freqs=freqs, device=str(device),
+                use_xsec=use_xsec)
 
     # ---------- 推理 (逐月流式, 峰值内存 ~1 个月) ----------
     logger.info("逐月构建测试集并预测", start=str(start_date), end=str(end_date))
     parts = []
     n_rows = 0
     with torch.no_grad():
-        for Xs, _, idx_df, _ in _iter_dataset(
+        for Xs, _, idx_df, keys in _iter_dataset(
                 table, start_date, end_date, "infer",
                 ckpt["aligned_minutes"], stats, freqs=freqs, seq_lens=seq_lens):
             if len(idx_df) == 0:
                 continue
             Xt = [torch.from_numpy(np.ascontiguousarray(x)) for x in Xs]
             preds = []
+            if use_xsec:
+                sec_ids = _section_ids(keys)
+            else:
+                sec_ids = None
             for i in range(0, len(idx_df), BATCH):
                 xb = [t[i:i + BATCH].to(device) for t in Xt]
-                preds.append(model(xb).cpu().numpy())
+                sidb = (None if sec_ids is None else
+                        torch.from_numpy(sec_ids[i:i + BATCH]).to(device))
+                preds.append(model(xb, sec_ids=sidb).cpu().numpy())
             out = idx_df.copy()
-            out["factor"] = (np.concatenate(preds).astype(np.float64)
+            # 权重是按旧 label(vwap/end-1)训练的, 方向与平台 vwap_return=
+            # end/vwap-1 相反; 不重训, 直接对 factor 取负号纠正方向。
+            out["factor"] = (-np.concatenate(preds).astype(np.float64)
                              if preds else np.zeros(len(out)))
             parts.append(out)
             n_rows += len(out)

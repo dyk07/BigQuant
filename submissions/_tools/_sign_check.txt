@@ -1,0 +1,14 @@
+/home/diamondpeach/miniconda3/envs/bigquant/lib/python3.9/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+  202407: n=179,506 pred_mean=1.0242
+  202408: n=171,461 pred_mean=0.8075
+  202409: n=147,246 pred_mean=2.0112
+  202410: n=139,842 pred_mean=3.5569
+  202411: n=163,794 pred_mean=2.9080
+  202412: n=171,306 pred_mean=1.2213
+
+=== factor vs label IC (local eval) ===
+  IC_mean = +0.0875
+  IC_std  = 0.1354
+  n_sections = 976
+  => 若为正: 推理方向正确, 平台翻转来自数据口径; 若为负: 提交侧方向反了
