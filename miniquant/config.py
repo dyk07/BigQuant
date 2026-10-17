@@ -103,6 +103,13 @@ class Config:
     transformer_layers: int = 2              # Transformer Encoder 层数
     transformer_heads: int = 4               # 注意力头数
 
+    # --- 截面上下文（交叉注意力，需配合截面 batch 使用） ---
+    use_section_batch: bool = False         # 按截面组织 batch（损失对齐 soft-IC）
+    use_xsec: bool = False                  # 启用截面交叉注意力（需 use_section_batch）
+    xsec_layers: int = 1                    # 交叉注意力 Transformer 块数
+    xsec_heads: int = 4                     # 交叉注意力头数
+    accum_steps: int = 4                    # 截面 batch 模式下的梯度累积步数
+
     # ===== 训练 =====
     batch_size: int = 512
     lr: float = 1e-3

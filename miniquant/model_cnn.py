@@ -99,6 +99,39 @@ class AttentionPooling(nn.Module):
         return torch.cat([att, avg], dim=-1)        # [B, 2D]
 
 
+class CrossSectionAttention(nn.Module):
+    """截面自注意力：同截面内一只股票 attend 到其余股票。
+
+    输入 [N, D]（一个截面的池化表示），输出 [N, D]（上下文增强后）。
+    对 N 维置换等变，不引入 per-instrument embedding，避免记住股票身份、
+    在测试集新股票上泛化变差。
+    """
+
+    def __init__(self, dim, heads=4, layers=1, dropout=0.1):
+        super().__init__()
+        self.blocks = nn.ModuleList()
+        for _ in range(layers):
+            self.blocks.append(nn.ModuleDict({
+                "attn": nn.MultiheadAttention(dim, heads, dropout=dropout,
+                                              batch_first=True),
+                "norm1": nn.LayerNorm(dim),
+                "ffn": nn.Sequential(
+                    nn.Linear(dim, dim * 4),
+                    nn.GELU(),
+                    nn.Linear(dim * 4, dim),
+                ),
+                "norm2": nn.LayerNorm(dim),
+            }))
+
+    def forward(self, z):                    # [N, D]
+        z = z.unsqueeze(0)                   # [1, N, D]（1 = 截面这一维）
+        for block in self.blocks:
+            a, _ = block["attn"](z, z, z, need_weights=False)
+            z = block["norm1"](z + a)
+            z = block["norm2"](z + block["ffn"](z))
+        return z.squeeze(0)                  # [N, D]
+
+
 class CNNTransformerEncoder(nn.Module):
     """
     CNN + Transformer 编码器（不含最终 head）。
@@ -183,10 +216,24 @@ class CNNTransformerModel(nn.Module):
             dropout=dropout,
         )
         self.pool = AttentionPooling(hidden)
+        use_xsec = getattr(cfg, "use_xsec", False)
+        if use_xsec:
+            xsec_layers = getattr(cfg, "xsec_layers", 1)
+            xsec_heads = getattr(cfg, "xsec_heads", 4)
+            self.xsec = CrossSectionAttention(
+                self.pool.out_dim,
+                heads=xsec_heads,
+                layers=xsec_layers,
+                dropout=dropout,
+            )
+            head_in = self.pool.out_dim * 2   # 原始表示 ‖ 截面上下文表示
+        else:
+            self.xsec = None
+            head_in = self.pool.out_dim
         head_dim = getattr(cfg, "fused_dim", 64)
         self.head = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(self.pool.out_dim, head_dim),
+            nn.Linear(head_in, head_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(head_dim, 1),
@@ -195,8 +242,10 @@ class CNNTransformerModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, 25]
         h = self.encoder(x)   # [B, T, hidden_dim]
-        h = self.pool(h)      # [B, 2*hidden_dim]
-        return self.head(h).squeeze(-1)  # [B]
+        z = self.pool(h)      # [B, 2*hidden_dim]
+        if self.xsec is not None:
+            z = torch.cat([z, self.xsec(z)], dim=-1)  # 残差式拼接
+        return self.head(z).squeeze(-1)  # [B]
 
 
 def count_parameters(model) -> int:

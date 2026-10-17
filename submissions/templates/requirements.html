@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <title>新手入门 - BigQuant量化交易</title>
+  <meta charSet="utf-8" />
+  <meta name="theme-color" content="#FFF" />
+  <meta name="slack-app-id" content="" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="description" content="新手入门欢迎参加2026年第二届“进益资本”杯量化因子挑战赛。比赛包含“因子挖掘”和“端到端模型”两个赛道，均使用A股分钟行情与盘口数据，预测未来30分钟VWAP收益。两个赛道的报名、开发和评测流程相同，提交内容略有区别。&gt;比赛相关操作均须在“进益资本”空间内完成：&lt;https://jinyicap..." />
+  <meta name="keywords" content="新手入门" />
+  <meta property="og:site_name" content="新手入门 - BigQuant量化交易" />
+  <meta property="og:url" content="https://bigquant.com/wiki/doc/BUxEAZqpLa" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="新手入门 - BigQuant量化交易" />
+  <meta property="og:description" content="新手入门欢迎参加2026年第二届“进益资本”杯量化因子挑战赛。比赛包含“因子挖掘”和“端到端模型”两个赛道，均使用A股分钟行情与盘口数据，预测未来30分钟VWAP收益。两个赛道的报名、开发和评测流程相同，提交内容略有区别。&gt;比赛相关操作均须在“进益资本”空间内完成：&lt;https://jinyicap..." />
+  <meta property="og:image" content="/favicon.ico" />
+  <link rel="canonical" href="https://bigquant.com/wiki/doc/BUxEAZqpLa" data-react-helmet="true" />
+  <link async rel="stylesheet" href="//cdn.bigquant.com/wiki/static/css/custom.css" />
+  <link rel="shortcut icon" type="image/png" href="/favicon.ico" sizes="32x32" />
+  <link rel="apple-touch-icon" type="image/png" href="/static/img/logo-Q-105.png" sizes="192x192" />
+  <link rel="search" type="application/opensearchdescription+xml" href="//cdn.bigquant.com/wiki/opensearch.xml"
+    title="新手入门 - BigQuant量化交易" />
+  
+  <style>
+    body,
+    html {
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      display: flex;
+      width: 100%;
+      height: 100%;
+    }
+
+    #root {
+      flex: 1;
+      min-height: 100%;
+      width: 100%;
+    }
+  </style>
+ <script>
+      if (window.location.hostname !== 'bigquant.com') {
+        var s = document.createElement('style');
+        s.textContent = '#root>.page{display:none}';
+        document.head.appendChild(s);
+      }
+  </script>
+</head>
+
+<body>
+  <div id="root">
+    <div class="page">
+    <header class="index">
+      <div class="reload-header-wrapper">
+        <div class="reload-header-left">
+          <div class="reload-header-logo"><svg class="reload-header-logo__svg" width="36px" height="37px"
+              viewBox="0 0 36 37" version="1.1" xmlns="http://www.w3.org/2000/svg"
+              xmlns:xlink="http://www.w3.org/1999/xlink">
+              <title>logo</title>
+              <g id="导航栏" stroke="none" stroke-width="1" fill="none" fill-rule="evenodd">
+                <g id="移动-深色背景下滑后改变为默认白色导航" transform="translate(-21, -176)">
+                  <g id="深色背景备份" transform="translate(0, 129.5)">
+                    <g id="logo" transform="translate(21, 47)">
+                      <path
+                        d="M12.819426,-3.45280103e-16 L23.180574,5.17920154e-16 C27.6381677,-3.00926524e-16 29.2545989,0.464128056 30.8842285,1.33566352 C32.5138581,2.20719898 33.792801,3.48614185 34.6643365,5.11577148 C35.5358719,6.74540111 36,8.3618323 36,12.819426 L36,23.180574 C36,27.6381677 35.5358719,29.2545989 34.6643365,30.8842285 C33.792801,32.5138581 32.5138581,33.792801 30.8842285,34.6643365 C29.2545989,35.5358719 27.6381677,36 23.180574,36 L12.819426,36 C8.3618323,36 6.74540111,35.5358719 5.11577148,34.6643365 C3.48614185,33.792801 2.20719898,32.5138581 1.33566352,30.8842285 C0.464128056,29.2545989 1.00308841e-16,27.6381677 -1.72640051e-16,23.180574 L3.45280103e-16,12.819426 C-2.00617683e-16,8.3618323 0.464128056,6.74540111 1.33566352,5.11577148 C2.20719898,3.48614185 3.48614185,2.20719898 5.11577148,1.33566352 C6.74540111,0.464128056 8.3618323,2.00617683e-16 12.819426,-3.45280103e-16 Z"
+                        id="bg" class="reload-header-logo__bg" fill="#E74C3C"></path>
+                      <g id="Q" transform="translate(8.5714, 7.7143)" fill="#FFFFFF" class="reload-header-logo__text">
+                        <path
+                          d="M8.85587715,1.77635684e-15 C13.746843,1.77635684e-15 17.7117543,4.3343536 17.7117543,9.68104972 C17.7117543,13.5928799 15.5893777,16.9628134 12.5347525,18.4898286 C14.0859719,19.7951224 15.8153235,20.490945 17.7224617,20.5778826 C18.6808806,20.5778826 18.1866479,21.4965794 17.5325076,21.4965794 L17.1242864,21.4965794 C14.6631711,21.4461068 12.2851685,20.7086934 9.99027854,19.2843392 C9.61930794,19.3353013 9.24045532,19.3620994 8.85587715,19.3620994 C3.96491125,19.3620994 0,15.0277458 0,9.68104972 C0,4.3343536 3.96491125,1.77635684e-15 8.85587715,1.77635684e-15 Z M8.85587715,0.841830411 C6.75974891,0.841830411 5.06050123,4.7992837 5.06050123,9.68104972 C5.06050123,14.5628158 6.75974891,18.520269 8.85587715,18.520269 C10.9520054,18.520269 12.6512531,14.5628158 12.6512531,9.68104972 C12.6512531,4.7992837 10.9520054,0.841830411 8.85587715,0.841830411 Z">
+                        </path>
+                      </g>
+                    </g>
+                  </g>
+                </g>
+              </g>
+            </svg><svg t="1701070060889" class="reload-header-logo__title" viewBox="0 0 3200 1024" version="1.1"
+              xmlns="http://www.w3.org/2000/svg" p-id="2145" width="200" height="200">
+              <path
+                d="M50.112 253.76v519.936h234.88c54.432 0 97.408-10.208 127.488-30.592 35.072-24.768 52.992-63.36 52.992-115.776 0-34.944-8.608-63.36-25.088-83.744-17.184-21.12-42.24-34.944-75.904-41.504 25.792-10.208 45.12-24 58.72-42.976 13.6-20.384 20.8-45.12 20.8-74.24 0-39.36-13.632-70.656-40.128-93.952-28.64-24.768-68.736-37.12-119.584-37.12H50.112z m83.808 69.92h129.6c34.368 0 58.72 5.824 74.496 17.472 14.304 10.912 22.176 29.12 22.176 53.888 0 26.944-7.872 46.592-22.176 58.976-15.04 11.648-40.128 18.24-75.936 18.24H133.92v-148.576z m0 218.464h141.056c37.216 0 64.448 6.528 81.6 19.648 16.512 13.12 25.088 34.24 25.088 64.064 0 29.12-11.456 49.536-34.368 62.624-17.92 10.208-42.976 15.296-74.464 15.296H133.92v-161.632zM592.192 243.584c-15.744 0-28.64 5.12-39.36 15.296-10.752 10.176-15.776 23.296-15.776 39.328 0 16 5.024 29.12 15.776 40.032 10.72 10.208 23.616 15.296 39.36 15.296 15.776 0 28.64-5.12 39.392-15.296 10.752-10.176 16.48-24 16.48-40.032 0-16.032-5.76-29.12-15.776-39.36-10.72-10.176-24.32-15.264-40.096-15.264z m-40.8 153.632v376.48h81.6V397.216h-81.6zM887.936 387.04c-50.112 0-90.944 17.472-121.728 52.416-31.52 34.944-46.56 80.832-46.56 137.6 0 56.832 15.04 102.72 46.56 136.928 30.784 33.504 71.616 50.976 121.728 50.976 45.824 0 82.336-19.648 109.568-58.24v55.328c0 66.976-30.784 100.48-92.384 100.48-28.64 0-49.408-4.352-62.304-12.384-13.6-8.736-22.176-23.296-26.496-44.416h-81.6c7.136 42.24 24.32 72.832 51.52 93.216 27.2 18.944 66.624 29.12 118.88 29.12 116 0 174.016-59.712 174.016-178.4V397.216h-81.632v45.888c-27.2-37.856-63.744-56.064-109.568-56.064z m12.896 66.976c30.784 0 55.136 10.944 72.32 32.768 16.48 21.856 25.056 51.712 25.056 90.304 0 37.856-8.576 66.976-25.056 88.832-17.184 20.384-41.536 31.328-73.024 31.328-35.84 0-60.896-12.384-76.64-36.416-13.6-20.384-20.032-48.064-20.032-83.744 0-39.328 8.576-69.184 25.76-90.304 17.184-21.824 40.832-32.768 71.616-32.768zM1399.232 243.584c-78.784 0-140.352 25.472-184.768 77.92-42.976 49.504-63.712 113.6-63.712 192.96 0 78.656 20.736 142.72 63.712 192.256 44.416 50.976 105.984 77.184 184.768 77.184 51.52 0 96.64-11.648 133.888-33.504 18.624 24.768 38.72 48.576 58.048 76.992l57.248-43.52c-18.624-27.648-42.24-55.328-60.864-80.064 40.096-48.064 60.864-111.424 60.864-189.344 0-80.096-21.472-144.896-64.448-193.696-45.12-51.712-106.688-77.184-184.736-77.184z m0 75.008c52.96 0 93.76 16.736 122.432 51.68 27.904 34.976 42.24 83.008 42.24 144.192 0 50.24-10.016 91.744-28.64 123.776-24.32-29.12-41.28-51.168-68.48-83.136l-50.88 45.28c20.48 26.72 44.16 55.36 69.952 87.36-24.32 13.856-52.992 21.12-86.656 21.12-52.992 0-94.496-18.176-123.136-53.856-27.936-34.976-41.536-81.568-41.536-140.544 0-59.712 13.6-106.304 41.536-141.28 29.344-36.384 70.144-54.592 123.136-54.592zM1720 397.216v234.496c0 101.216 44.416 152.192 133.216 152.192 45.824 0 84.48-19.68 116-59.008v48.8h81.632V397.216h-81.6v230.112c-7.2 26.944-19.36 48.064-35.84 64.096-16.448 15.264-33.664 23.296-51.52 23.296-28.672 0-48.736-7.296-61.6-21.12-12.896-14.56-18.624-36.416-18.624-67.008v-229.376H1720zM2305.056 387.04c-47.264 0-84.48 8-111.68 25.472-32.256 18.944-52.288 49.536-60.16 91.04l80.896 6.528c4.32-19.648 15.04-34.24 30.816-43.68 13.6-8.736 31.488-12.384 54.4-12.384 52.992 0 79.488 24.032 79.488 73.568v14.56l-80.896 2.176c-54.432 1.44-96.672 13.12-126.752 34.944-32.96 22.592-48.704 55.36-48.704 97.6 0 31.296 11.456 56.768 34.368 77.184 22.208 19.648 52.288 29.856 90.944 29.856 32.224 0 60.16-5.824 83.776-16.768a145.056 145.056 0 0 0 52.992-42.944v49.504h75.936v-240.32c0-45.856-11.488-80.8-34.4-104.832-25.76-27.68-66.56-41.504-121.024-41.504z m73.792 214.816v18.912c0 29.12-11.488 53.152-32.96 72.096-21.472 18.208-48 27.68-79.488 27.68-17.92 0-32.224-5.12-43.68-13.856-11.456-8.736-16.48-19.648-16.48-32.768 0-45.12 32.224-68.448 97.408-69.888l75.2-2.176zM2737.6 387.04c-22.208 0-42.24 4.352-60.896 13.824-17.888 8.736-34.368 22.56-48.672 40.064v-43.712h-81.632v376.48h81.6V547.2c2.88-29.856 12.928-53.152 30.08-69.184a74.08 74.08 0 0 1 53.024-21.856c55.84 0 83.776 30.592 83.776 92.48v225.024h81.6v-232.32c0-103.36-46.528-154.336-138.88-154.336zM3078.464 275.616H2996.8v121.6h-66.56v68.48h66.56v212.608c0 30.592 7.168 53.152 21.504 69.184 15.04 17.472 38.656 26.24 70.88 26.24h62.304v-68.48h-48.704c-8.576 0-14.304-2.176-18.592-6.56-4.32-5.088-5.76-11.648-5.76-20.384v-212.64h82.368v-68.448h-82.336v-121.6z"
+                fill="#000000" p-id="2146"></path>
+            </svg></div>
+        </div>
+        <div class="reload-header-center">
+          <a href="/">首页</a>
+          <a rel="nofollow" href="/aistudio/landing">编写策略</a>
+          <a href="/data/home">数据平台</a>
+          <!-- <a href="/alpha">因子研究</a> -->
+          <a href="/square">策略社区</a>
+          <a rel="nofollow" href="/trade">我的策略</a>
+          <a href="/college">宽客学院 <svg data-v-8fb3a851="" class="kb-icon kb-menu-arrow" aria-hidden="true">
+              <use data-v-8fb3a851="" xlink:href="#icon-kb-arrow"></use>
+            </svg></a>
+          <a href="/wiki/home" class="reload-header-center-active">知识库<svg data-v-8fb3a851=""
+              class="kb-icon kb-menu-arrow" aria-hidden="true">
+              <use data-v-8fb3a851="" xlink:href="#icon-kb-arrow"></use>
+            </svg></a>
+        </div>
+        <div class="reload-header-right">
+          <a rel="nofollow" class="load-register" href="/?next=/wiki/home">免费注册</a>
+          <a rel="nofollow" class="load-login" href="/?next=/wiki/home">登录</a>
+        </div>
+        <div class="reload-mobile-right"><svg class="kb-icon mobile-menu" aria-hidden="true">
+            <use xlink:href="#icon-kb-menu"></use>
+          </svg></div>
+      </div>
+    </header>
+    <div class="markdown-content">
+      <div class="markdown-nav"><aside><ul><li><a href="/wiki/collection/SkPzwuq9oo">BigQuant使用文档</a></li><li><a href="/wiki/collection/1rppcme9Zo">BigQuant 2026年度私享会</a></li><li><a href="/wiki/collection/dhj0C1Hfqz">精华帖子</a></li><li><a href="/wiki/collection/vHvL2mwsbm">量化数据分析</a></li><li><a href="/wiki/collection/QkFJ6ZCzEq">AI量化知识树</a></li><li><a href="/wiki/collection/ZpKXhCSGXv">精品课程</a></li><li><a href="/wiki/collection/dLopDVBB53">研报&论文</a></li><li><a href="/wiki/collection/7tukg3sr8s">公告通知</a></li><li><a href="/wiki/collection/YbyzplDKPp">问答交流</a></li><li><a href="/wiki/collection/9cfkHkaXTo">比赛讨论</a></li><li><a href="/wiki/collection/zq2v39jJil">平台建议</a></li><li><a href="/wiki/collection/u492e5zAzP">策略分享</a></li><li><a href="/wiki/collection/SHC8yss3vv">旗舰版会员</a></li><li><a href="/wiki/collection/d4VYXxD5JF">历史文档</a></li></ul></aside></div>
+      <div class="markdown-body"><div><div><a href="/wiki/collection/9cfkHkaXTo">比赛讨论</a></div><article><h1>新手入门</h1><p>由hxgre创建，最终由hxgre<time datetime="1790736280">更新于2026-09-30 02:44</time> 被浏览 116 用户<p><h1>新手入门</h1>
+<p>欢迎参加 <strong>2026 年第二届“进益资本”杯量化因子挑战赛</strong>。</p>
+<p>比赛包含“因子挖掘”和“端到端模型”两个赛道，均使用 A 股分钟行情与盘口数据，预测未来 30 分钟 VWAP 收益。两个赛道的报名、开发和评测流程相同，提交内容略有区别。</p>
+<blockquote>
+<p>比赛相关操作均须在“进益资本”空间内完成：<a href="http://jinyicapital.bigquant.com/" rel="nofollow">https://jinyicapital.bigquant.com/</a></p>
+</blockquote>
+<h2>一、报名参赛</h2>
+<p>进入比赛页面并提交报名。审核通过后：</p>
+<ul>
+<li>“报名参赛”按钮将变为“提交代码”；</li>
+<li>平台会自动将您加入“进益资本”空间；</li>
+<li>比赛数据权限将自动开通。</li>
+</ul>
+<p>比赛数据位于数据平台的 <code>/进益资本杯2026</code> 目录，也可从“比赛 → 数据”查看数据说明和训练数据。</p>
+<p>报名须知：</p>
+<ul>
+<li>报名截止：<strong>2026 年 10 月 7 日 23:59:59</strong>；</li>
+<li>每位选手只能加入一支队伍，建议每队 1～3 人；</li>
+<li>参加最终决赛的队伍，须至少有一位清华大学在读学生。</li>
+</ul>
+<h2>二、选择赛道与模板</h2>
+<p>在“比赛 → 代码”中选择模板，并克隆到自己的开发环境。请勿直接修改公共模板。</p>
+<table>
+<thead>
+<tr>
+<th>赛道</th>
+<th>模板</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>因子挖掘</td>
+<td><code>demo_sql.ipynb</code></td>
+<td>使用 DAI SQL 计算因子，速度快、内存占用低，推荐优先使用</td>
+</tr>
+<tr>
+<td>因子挖掘</td>
+<td><code>demo_udf.ipynb</code></td>
+<td>在 DAI 中运行自定义 Python 函数</td>
+</tr>
+<tr>
+<td>因子挖掘</td>
+<td><code>demo_py.ipynb</code></td>
+<td>使用 pandas、NumPy 等工具计算，需注意内存占用</td>
+</tr>
+<tr>
+<td>端到端模型</td>
+<td><code>Transformer_modelsave_train.ipynb</code></td>
+<td>训练模型并保存参数，训练代码需整理为 <code>.py</code> 文件</td>
+</tr>
+<tr>
+<td>端到端模型</td>
+<td><code>Transformer_modelsave_predict.ipynb</code></td>
+<td>加载模型参数并执行推理</td>
+</tr>
+</tbody>
+</table>
+<h2>三、实现评测入口</h2>
+<p>提交中必须有且仅有一个 Notebook。平台会导入其中的 <code>main</code> 函数：</p>
+<pre><code class="language-python">def main(datasources, start_date, end_date):
+    # 读取数据，计算因子或执行模型推理
+    return result
+</code></pre>
+<p>平台会传入：</p>
+<ul>
+<li><code>datasources</code>：数据源逻辑名与当前评测表名的映射；</li>
+<li><code>start_date</code>：评测开始时间；</li>
+<li><code>end_date</code>：评测结束时间。</li>
+</ul>
+<p>可用的数据源逻辑名包括：</p>
+<table>
+<thead>
+<tr>
+<th>逻辑名</th>
+<th>数据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bar1m</code></td>
+<td>1 分钟 K 线及盘口快照</td>
+</tr>
+<tr>
+<td><code>bar5m</code></td>
+<td>5 分钟 K 线及盘口快照</td>
+</tr>
+<tr>
+<td><code>bar15m</code></td>
+<td>15 分钟 K 线及盘口快照</td>
+</tr>
+<tr>
+<td><code>bar30m</code></td>
+<td>30 分钟 K 线及盘口快照</td>
+</tr>
+</tbody>
+</table>
+<p>通过逻辑名获取数据表，例如：</p>
+<pre><code class="language-python">bar1m = datasources[&quot;bar1m&quot;]
+</code></pre>
+<p>不要在 SQL 中硬编码物理表名，否则公榜和私榜切换数据集时可能评测失败。股票池可使用 <code>cpt_jyc_2026_instruments</code>。</p>
+<p>因子或推理所需的包导入、自定义函数和参数配置，应放在 <code>main()</code> 内或随提交文件提供。调试、画图等非必要代码可放在：</p>
+<pre><code class="language-python">if __name__ == &quot;__main__&quot;:
+    # 本地调试代码
+</code></pre>
+<h2>四、因子挖掘赛道要求</h2>
+<h3>1. 输出格式</h3>
+<p><code>main()</code> 必须返回仅包含以下三列的 DataFrame：</p>
+<table>
+<thead>
+<tr>
+<th>date</th>
+<th>instrument</th>
+<th style="text-align:right">factor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2023-01-03 10:30:00</td>
+<td><a href="http://000001.SZ" rel="nofollow">000001.SZ</a></td>
+<td style="text-align:right">0.05</td>
+</tr>
+<tr>
+<td>2023-01-03 10:30:00</td>
+<td><a href="http://000002.SZ" rel="nofollow">000002.SZ</a></td>
+<td style="text-align:right">-0.12</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><code>date</code>：平台约定的 30 分钟采样时点，精确到分钟；</li>
+<li><code>instrument</code>：股票代码；</li>
+<li><code>factor</code>：因子值，默认值越大代表预测的未来收益越高。</li>
+</ul>
+<p>每天约有 8 个非重叠日内截面。不得输出集合竞价等特殊时段，也不得使用因子时点之后的数据。</p>
+<p>返回前建议清理结果：</p>
+<pre><code class="language-python">result = result.replace([np.inf, -np.inf], np.nan)
+result = result.dropna(subset=[&quot;factor&quot;])
+result = result.drop_duplicates([&quot;date&quot;, &quot;instrument&quot;])
+return result[[&quot;date&quot;, &quot;instrument&quot;, &quot;factor&quot;]]
+</code></pre>
+<h3>2. 提交前检查</h3>
+<ul>
+<li>输出列必须且仅有 <code>date</code>、<code>instrument</code>、<code>factor</code>；</li>
+<li>时间均为合法的 30 分钟采样点，且无整段缺失；</li>
+<li>每个评估时点的因子缺失率不高于 <strong>40%</strong>；</li>
+<li>不含无穷值、非法数值或重复的 <code>date + instrument</code>；</li>
+<li>因子计算未使用未来数据；</li>
+<li>结果已与比赛股票池对齐。</li>
+</ul>
+<h2>五、本地开发与验证</h2>
+<p>因子赛道开发数据范围为 <strong>2020—2024 年</strong>，股票池以中证 1000 指数历史成分股为基础。</p>
+<p>分钟数据量较大，建议：</p>
+<ul>
+<li>先用短时间区间调通，再扩大测试范围；</li>
+<li>只查询必要字段，并使用 <code>compression=True</code>；</li>
+<li>优先使用 DAI SQL 完成筛选、聚合和时序计算；</li>
+<li>滚动计算可向 <code>start_date</code> 前多取数据，但只返回评测区间内结果；</li>
+<li>根据数据量选择 4C/16G 或更高配置。</li>
+</ul>
+<p>因子计算完成后，可使用比赛评估模块检查：</p>
+<pre><code class="language-python">from bigmodule import M
+
+result = M.jyc_eval._latest(
+    factor_data=factor_data,
+    show=True,
+)
+</code></pre>
+<p>平台会统一进行去极值、标准化和 BARRA 风格剔除，并综合评估 IC 均值、IC_IR、多空组合夏普比率、压力场景稳定性和换手率。</p>
+<h2>六、端到端模型数据下载</h2>
+<blockquote>
+<p>**申请与审核时间提醒：**数据下载申请自 <strong>2026 年 9 月 30 日</strong>起开放，并于当天集中处理一天。需要申请的同学请尽快提交材料。<strong>2026 年 10 月 1 日至 10 月 7 日国庆假期期间暂停处理</strong>，未处理完的申请将从 <strong>2026 年 10 月 8 日</strong>起继续处理。</p>
+</blockquote>
+<p><strong>端到端比赛提供本地化数据下载链接</strong>，需要完成身份核验并签署限制协议后，可申请下载数据到本地训练：</p>
+<ol>
+<li>向比赛小助手发送本人学生卡照片和平台用户 ID；</li>
+<li>签署并回传小助手发送的限制协议；</li>
+<li>审核通过后，接收数据下载链接。</li>
+</ol>
+<p>下载数据仅限本人或本队参赛使用，不得外传或用于其他用途。<strong>小助手添加二维码</strong>：</p>
+<p><img src="/wiki/api/attachments.redirect?id=9d2ef340-3af9-4a46-9151-799baee30e62" alt="" loading="lazy"></p>
+<h2>七、提交代码</h2>
+<p>开发完成后，在比赛页面点击“提交代码”。平台会切换至验证集并重新运行提交代码，不接受预先计算好的离线结果。</p>
+<p>验证集在正式评测区间前额外提供一年历史数据，可用于滚动窗口、滞后项和序列模型计算；最终结果仍须限制在 <code>start_date</code> 至 <code>end_date</code> 内。</p>
+<h3>通用要求</h3>
+<ul>
+<li>提交中有且仅有一个 Notebook；</li>
+<li>Notebook 包含可调用的 <code>main(datasources, start_date, end_date)</code>；</li>
+<li>所需脚本、配置和模型参数均已上传；</li>
+<li>代码可在指定线上环境完整运行；</li>
+<li>总运行时间不超过 <strong>3 小时</strong>；</li>
+<li>评测环境无法访问外部网络。</li>
+</ul>
+<h3>不同赛道的提交内容</h3>
+<ul>
+<li><strong>因子挖掘</strong>：通常提交包含 <code>main()</code> 的 Notebook；如有需要，可附带 <code>.py</code>、<code>.json</code> 文件。</li>
+<li><strong>端到端模型</strong>：提交推理 Notebook、训练与推理代码、配置、随机种子和已训练模型参数。公榜评测仅加载模型参数进行推理，不会使用验证集重新训练。</li>
+</ul>
+<p>参考 Transformer 模板时，可提交预测 Notebook、<code>transformer_train.py</code> 和 <code>transformer_model.json</code>。</p>
+<p>提交后可在“比赛 → 提交记录”查看状态和成绩。评测需要排队，请勿短时间重复提交同一份代码。</p>
+<p>若评测失败，请依次检查：</p>
+<ol>
+<li>是否只提交了一个 Notebook；</li>
+<li>是否通过 <code>datasources</code> 获取数据表；</li>
+<li>脚本、配置和模型参数是否完整；</li>
+<li>返回列、时间点和评测区间是否正确；</li>
+<li>内存或运行时间是否超限。</li>
+</ol>
+<h2>八、公榜与私榜</h2>
+<table>
+<thead>
+<tr>
+<th>数据集</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>公榜训练集</td>
+<td>开发、调试和研究，不产生公榜成绩</td>
+</tr>
+<tr>
+<td>公榜验证集</td>
+<td>统一重跑提交代码并展示公榜成绩</td>
+</tr>
+<tr>
+<td>私榜数据集</td>
+<td>最终样本外评估，决定最终排名</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>公榜提交截止：<strong>2026 年 10 月 29 日 23:59:59</strong>；</li>
+<li>私榜候选选择截止：<strong>2026 年 10 月 30 日 23:59:59</strong>；</li>
+<li>候选确认后，不得修改代码、参数、依赖或随机种子。</li>
+</ul>
+<p>团队成员可分别提交，团队最终成绩取队内所有有效个人提交的最高分。建议提前完成运行验证和候选选择。</p>
+<h2>九、计算资源与辅助工具</h2>
+<h3>计算资源</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>配置</th>
+<th>费用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>免费 CPU</td>
+<td>4 核 / 16 GiB</td>
+<td>免费</td>
+</tr>
+<tr>
+<td>免费 CPU</td>
+<td>8 核 / 32 GiB</td>
+<td>免费</td>
+</tr>
+<tr>
+<td>GPU</td>
+<td>A100 80G × 1、32 VCPU、256 GiB</td>
+<td>600 宽币/小时</td>
+</tr>
+</tbody>
+</table>
+<p>开赛时，每队组长可获得 <strong>5,000 宽币</strong>。如需追加，可联系赛事组委会说明用途。</p>
+<h3>Cowork AI</h3>
+<p>访问地址：<a href="http://jinyicapital.bigquant.com/cowork" rel="nofollow">https://jinyicapital.bigquant.com/cowork</a>2</p>
+<p>Cowork 可辅助理解数据、修改代码和排查报错。开赛时每位选手可获得 <strong>100 积分</strong>，需要追加时可联系组委会。</p>
+<p>使用 AI 生成或修改代码后，仍须自行检查数据口径、时序合规性和运行结果。</p>
+<h2>十、交流与答疑</h2>
+<p>可在“比赛 → 代码”和“比赛 → 讨论”中交流平台使用、数据理解和研究方法。分享资料或开源代码时请注明来源并遵守许可，不得传播受限数据、他人非公开代码、账号凭证等敏感信息。</p>
+<p>如提交长时间无结果或无法定位错误，请通过比赛官方答疑渠道联系主办方。</p>
+</article><div>评论<ul><li>清华大学真牛逼</li></div></div>
+    </div>
+    {link}
+     </div>
+  </div>
+  
+    <script nonce="1137e81344a8cfdebb35046207f40330">
+      window.env = {"URL":"https://bigquant.com/wiki","AWS_S3_UPLOAD_BUCKET_URL":"","AWS_S3_ACCELERATE_URL":"","CDN_URL":"//cdn.bigquant.com/wiki","COLLABORATION_URL":"wss://bigquant.com/wiki","ENVIRONMENT":"production","MAXIMUM_IMPORT_SIZE":100000000,"SUBDOMAINS_ENABLED":false,"PDF_EXPORT_ENABLED":false,"DEFAULT_LANGUAGE":"zh_CN","EMAIL_ENABLED":false,"GOOGLE_ANALYTICS_ID":"G-B58V018K6L","APP_NAME":"BigQuant量化交易","BASE_URL":"/wiki","HOMEWORK_COLLECTION_ID":"3b45bdb9-14d2-4bf5-9705-839f575b91b4","SHARED_COLLECTION_IDS":["e3bd6ee2-2b66-465f-9125-cc51deba9b1b"],"analytics":{},"SEO_ENABLED":true,"SEO_DEFAULT_TITLE":"BigQuant量化交易","SEO_DEFAULT_DESCRIPTION":"BigQuant人工智能AI量化交易知识库提供AI量化交易入门知识点、股票期货金融、量化交易策略开发常见问题、股票量化交易平台基础功能使用等基础知识点，帮助Quant宽客和量化投资者无门槛的使用AI量化","SEO_DEFAULT_KEYWORDS":"量化交易知识点,量化交易基础知识"};
+    </script>
+  
+  <script nonce="1137e81344a8cfdebb35046207f40330">
+    if (
+      window.localStorage &&
+      window.localStorage.getItem("theme") === "dark"
+    ) {
+      var color = "#111319";
+      document.querySelector("#root").style.background = color;
+      document
+        .querySelector('meta[name="theme-color"]')
+        .setAttribute("content", color);
+    }
+  </script>
+  <script type="module" nonce="1137e81344a8cfdebb35046207f40330" src="//cdn.bigquant.com/wiki/static/assets/index-49a15bf3.js"></script>
+  <script async src="//cdn.bigquant.com/wiki/static/js/iconfont/iconfont.js"></script>
+</body>
+
+</html>

@@ -35,7 +35,7 @@ import structlog
 
 from Transformer_modelsave_train import (
     MODEL_PATH, BATCH, build_model, build_dataset, load_model, train_and_save,
-    _iter_dataset,
+    _iter_dataset, _encode_instrument,
 )
 
 logger = structlog.get_logger()
@@ -98,12 +98,18 @@ def main(datasources, start_date, end_date):
     gc.collect()
 
     # ---------- 对齐中证 1000 + 规范输出 ----------
-    stk = dai.query("SELECT date, instrument FROM cpt_jyc_2026_instruments",
+    stk = dai.query("SELECT date, instrument::string AS instrument "
+                    "FROM cpt_jyc_2026_instruments",
                     filters={"date": [start_date, end_date]}).df()
     # 逐月预测已按比赛的 8 个日内截面生成, 必须按完整时间精确对齐。
+    # 平台 instrument 为字符串代码('000001.SZ'), 内部 keys 用的是 _encode_instrument
+    # 的稳定 int 码; 对 cpt_jyc_2026_instruments 用同款函数还原成一致的码做 join,
+    # 再输出原始字符串 instrument (与 baseline 一致)。
     pred_df["date"] = pd.to_datetime(pred_df["date"])
     stk["date"] = pd.to_datetime(stk["date"])
-    result = (pd.merge(stk, pred_df, on=["date", "instrument"], how="inner")
+    stk["_code"] = _encode_instrument(stk["instrument"])
+    pred_df = pred_df.rename(columns={"instrument": "_code"})
+    result = (pd.merge(stk, pred_df, on=["date", "_code"], how="inner")
                 .replace([np.inf, -np.inf], np.nan).dropna(subset=["factor"])
                 .drop_duplicates(["date", "instrument"])[["date", "instrument", "factor"]]
                 .sort_values(["date", "instrument"])

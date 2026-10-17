@@ -51,12 +51,19 @@ AUCTION_MINUTE = 565                       # 09:25 集合竞价截面 (=9*60+25)
 SAMPLE_STEP = CFG.SAMPLE_STEP_MINUTES      # 采样网格(分钟)
 HORIZON_MINUTES = CFG.HORIZON_MINUTES      # 预测未来 30 分钟 VWAP
 
-# 比赛要求的日内截面: 09:25 开盘 + 各整/半点 (与本地 config.aligned_minutes 一致;
-# 15:00 无未来窗口, 训练/评估时标签为 NaN 会被自动剔除, 推理时仍输出)
-ALIGNED_MINUTES = [AUCTION_MINUTE] + [
+# 比赛要求的日内截面 (平台契约 8 个: 09:30, 10:00, 10:30, 11:00, 11:30,
+# 13:30, 14:00, 14:30)。与权威样例 submissions/baseline 的
+# LEGAL_OUTPUT_HHMM={930,1000,...,1430} 对齐。
+#   * 09:30 开盘截面: bar1m 无结束于 09:30 的 bar(只有 09:25 竞价 + 09:31 起),
+#     故**内部锚点**仍用 09:25 竞价 bar(AUCTION_MINUTE=565) 作窗口末位(数据严格
+#     早于 09:30), 仅在**输出时间戳**时把 565 对齐到 OPENING_SECTION=570(09:30)。
+#   * 15:00(900) 无未来窗口(标签 NaN), 平台不将其列为截面, 故**不产出**(见
+#     make_anchors 里的 AFTERNOON_END 过滤)。
+OPENING_SECTION = 570                       # 09:30 开盘截面(输出时刻, 分钟)
+ALIGNED_MINUTES = [AUCTION_MINUTE] + [      # 内部锚点分钟(09:25 竞价 bar 为开盘锚)
     m for m in range(MORNING_START + SAMPLE_STEP, MORNING_END + 1, SAMPLE_STEP)
 ] + [
-    m for m in range(AFTERNOON_START + SAMPLE_STEP, AFTERNOON_END + 1, SAMPLE_STEP)
+    m for m in range(AFTERNOON_START + SAMPLE_STEP, AFTERNOON_END, SAMPLE_STEP)
 ]
 
 
@@ -348,7 +355,12 @@ def _fetch_table(table, start, end, columns=None):
     buf = (pd.Timestamp(start) - pd.Timedelta(days=PAD_DAYS)).strftime("%Y-%m-%d")
     end_s = (pd.Timestamp(end) + pd.Timedelta(days=PAD_DAYS)).strftime(
         "%Y-%m-%d %H:%M:%S")
-    sel = ", ".join(cols) if isinstance(table, str) else "*"
+    # 平台表用字符串列 `instrument`(如 '000001.SZ'), 本地内部名是 instrument_id;
+    # SELECT 时把内部名映射回平台列名(与 baseline 一致: instrument::string AS
+    # instrument), 后续 _pick_cols 会再 rename 回 instrument_id 并做稳定 int 编码。
+    sel_cols = ["instrument::string AS instrument" if c == "instrument_id"
+                else c for c in cols]
+    sel = ", ".join(sel_cols) if isinstance(table, str) else "*"
     sql = f"SELECT {sel} FROM {table}"
     out = dai.query(sql, filters={"date": [buf, end_s]}).df()
     return _pick_cols(out)      # SQL 侧已过滤, 不再重复过滤
@@ -359,11 +371,31 @@ def _to_dataframe(table, start=None, end=None):
     return _fetch_table(table, start, end)
 
 
+def _encode_instrument(s):
+    """把股票标识统一成**稳定、与子集无关**的 int64 key。
+
+    平台 bar1m 表与 cpt_jyc_2026_instruments 的 instrument 是**字符串代码**
+    (如 '000001.SZ'), 本地 e2e 表的 instrument_id 是 **int16 枚举**:
+      * 整数 -> 原样 int64 (本地枚举, 与本地伪 dai 的股票池 int 一致);
+      * 字符串 -> 确定性 MD5 前缀散列成 60-bit 非负整数 (与子集/顺序无关,
+        同一字符串永远得到同一码; 输出时对 cpt_jyc_2026_instruments 用同款
+        函数即可还原 join)。
+    绝不用 factorize: 它会随停牌/复牌的子集漂移, 破坏跨月/跨表 join。
+    返回 int64 ndarray (可直接进 int64 keys 矩阵, 下游无需改动)。
+    """
+    import hashlib
+    s = pd.Series(s)
+    if pd.api.types.is_integer_dtype(s.dtype):
+        return s.to_numpy(dtype="int64")
+    def _code(x):
+        return int(hashlib.md5(str(x).encode("utf-8")).hexdigest()[:15], 16)
+    return s.map(_code).to_numpy(dtype="int64")
+
+
 def _shrink(df):
-    """把还原后的 DataFrame 压到最小内存占用 (float32 + int16 标的)。"""
+    """把还原后的 DataFrame 压到最小内存占用 (float32 + 编码后 int64 标的)。"""
     if "instrument_id" in df.columns:
-        df["instrument_id"] = pd.to_numeric(
-            df["instrument_id"], downcast="integer")
+        df["instrument_id"] = _encode_instrument(df["instrument_id"])
     for c in df.columns:
         if c in ("date", "day", "minute_of_day", "instrument_id"):
             continue
@@ -399,22 +431,35 @@ def _normalize(df):
         raise ValueError(f"表缺少必要列 date/instrument_id; 实际列={list(df.columns)}")
     df = df[keep]
     df["date"] = pd.to_datetime(df["date"])
-    df["instrument_id"] = pd.to_numeric(df["instrument_id"], downcast="integer")
+    df["instrument_id"] = _encode_instrument(df["instrument_id"])
     return df
 
 
 def restore_units(df):
-    """单位还原: OHLC 的 -1 -> NaN 并 /100; amount/盘口价格 /100;
-    盘口价格为 0 表示该侧无挂单 -> NaN(0 不是 0 元)。
+    """单位还原 + 缺失值语义 (兼容本地 e2e 与平台云端两种口径)。
+
+    * **价格类字段**(OHLC / amount / 盘口价):
+      - 本地 e2e 表是 int 的"分"(cents, 平台约定本地数据 float→int 压缩),
+        需 /100 还原为"元"; 缺失价记法 OHLC=-1、盘口价=0(该侧无挂单)。
+      - 平台云端表是 float 的"元"(无需 /100); OHLC 缺失为 NaN、盘口缺失为 0。
+      统一按 dtype 判断: 整数 → 视为"分"并 /100; 浮点 → 已是"元"直接保留。
+      (基线 baseline/exp009 亦声明「云端价格为元，无需 ÷100」。)
+    * **volume / deal_number / 盘口量 / 笔数** 均不缩放(股数/笔数), 只转 float32。
 
     就地修改 (不 copy), 并把结果降为 float32 以节省内存。
     """
     for f in _OHLC:
         if f in df.columns:
-            df[f] = df[f].where(df[f] != -1).astype("float32") / 100.0
+            if pd.api.types.is_integer_dtype(df[f]):
+                df[f] = df[f].where(df[f] != -1).astype("float32") / 100.0
+            else:
+                df[f] = df[f].astype("float32")
     for f in _PRICE_FIELDS:
         if f in df.columns and f not in _OHLC:
-            df[f] = df[f].astype("float32") / 100.0
+            if pd.api.types.is_integer_dtype(df[f]):
+                df[f] = df[f].astype("float32") / 100.0
+            else:
+                df[f] = df[f].astype("float32")
     for f in _BOOK:
         if f in df.columns and f.endswith(("1", "2", "3")) and "price" in f:
             df[f] = df[f].where(df[f] != 0.0)
@@ -424,7 +469,7 @@ def restore_units(df):
     for f in [c for c in _BOOK if "price" not in c]:
         if f in df.columns:
             df[f] = df[f].astype("float32")
-    # dtype 已在 _pick_cols 里降过 (float32/int16), 这里无需再 _shrink 一次拷贝
+    # dtype 已在 _pick_cols 里降过 (float32/int64), 这里无需再 _shrink 一次拷贝
     return df
 
 
@@ -739,11 +784,16 @@ def _build_month(table, first, last, mode, minutes, stats, freqs, seq_lens):
         T = int(seq_lens.get(f, max(1, CFG.LOOKBACK_MINUTES // FREQ_MINUTES[f])))
         X_list.append(gather_windows(per[f]["feat"], per[f]["anchors"][idx[f]], T))
     if len(keys):
+        # 输出时间戳对齐平台 8 截面契约 (baseline LEGAL_OUTPUT_HHMM):
+        #   09:25 竞价锚点 -> 输出 09:30 (开盘截面; bar1m 无 09:30 结束的 bar)
+        #   其余整/半点原样; 15:00 已被 make_anchors 剔除(无未来窗口, 平台不列)
+        out_mod = keys[:, 2].copy()
+        out_mod[out_mod == AUCTION_MINUTE] = OPENING_SECTION
         idx_df = pd.DataFrame({
             "date": (pd.to_datetime(keys[:, 1], unit="D")
-                     + pd.to_timedelta(keys[:, 2], unit="m")),
+                     + pd.to_timedelta(out_mod, unit="m")),
             "instrument": keys[:, 0].astype("int64"),
-            "minute_of_day": keys[:, 2].astype("int64"),
+            "minute_of_day": out_mod.astype("int64"),
         })
     else:
         idx_df = pd.DataFrame({"date": [], "instrument": [], "minute_of_day": []})

@@ -19,7 +19,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import Config
-from dataset import fit_scaler, apply_scaler, StockDataset
+from dataset import (fit_scaler, apply_scaler, StockDataset,
+                     make_section_batches, collate_sections)
 from pipeline import build_split, describe
 from model import E2EModel, count_parameters
 from model_cnn import CNNTransformerModel, count_parameters as count_parameters_cnn
@@ -35,38 +36,61 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, clip):
+def train_one_epoch(model, loader, optimizer, criterion, device, clip,
+                    accum_steps=1):
+    """训练一轮。loader 的每个 batch = 一个截面（soft-IC 语义）。
+
+    单截面 batch 较小（约 900–1000 只股票），用梯度累积稳定更新：
+    每 accum_steps 个截面做一次 optimizer.step()。
+    """
     model.train()
     total, count = 0.0, 0
-    for xb, yb in loader:
+    optimizer.zero_grad(set_to_none=True)
+    for step, (xb, yb, _) in enumerate(loader):
         xb, yb = xb.to(device), yb.to(device)
-        optimizer.zero_grad(set_to_none=True)
         pred = model(xb)
-        loss = criterion(pred, yb)
+        # 除以累积步数，使不同 accum_steps 下的更新尺度可比
+        loss = criterion(pred, yb) / max(accum_steps, 1)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-        optimizer.step()
-        total += loss.item() * len(yb)
+        total += loss.item() * len(yb) * max(accum_steps, 1)
         count += len(yb)
+        if (step + 1) % accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
     return total / max(count, 1)
 
 
 @torch.no_grad()
 def predict(model, loader, device):
+    """前向并输出全量预测。截面采样下 batch 顺序被打乱，需按样本
+    全局下标还原到 X 的原始顺序（与 y/meta 对齐）。"""
     model.eval()
-    preds = []
-    for xb, _ in loader:
+    xs, ys, preds = [], [], []
+    for xb, yb, idx in loader:
         preds.append(model(xb.to(device)).cpu().numpy())
+        ys.append(yb.numpy())
+        xs.append(idx.numpy())
     if not preds:
         return np.zeros((0,), dtype=np.float32)
-    return np.concatenate(preds, axis=0)
+    pred = np.concatenate(preds, axis=0)
+    order = np.argsort(np.concatenate(xs, axis=0))
+    return pred[order]
 
 
-def _sub_loader(X, cfg, device):
-    """为快速抽样评估构造一个只做前向的 loader（y 为占位）。"""
-    ds = StockDataset(X, np.zeros(len(X), dtype=np.float32))
-    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
-                      num_workers=0, pin_memory=(device.type == "cuda"))
+def _section_loader(X, y, meta, cfg, device, shuffle=False, seed=None):
+    """按截面 batch 的 DataLoader，返回 (X, y, 全局下标)。"""
+    ds = StockDataset(X, y, return_idx=True)
+    sampler = make_section_batches(meta, min_stocks=10, shuffle=shuffle,
+                                   seed=seed if seed is not None else cfg.seed)
+    return DataLoader(ds, batch_sampler=sampler, collate_fn=collate_sections,
+                      num_workers=cfg.num_workers,
+                      pin_memory=(device.type == "cuda"))
+
+
+def _sub_loader(X, y, meta, cfg, device):
+    """为快速抽样评估构造一个只做前向的截面 loader。"""
+    return _section_loader(X, y, meta, cfg, device, shuffle=False)
 
 
 def parse_args():
@@ -94,6 +118,12 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--shuffle-label", action="store_true",
                    help="防泄漏对照：打乱训练/验证标签，IC 应≈0")
+    p.add_argument("--xsec", action="store_true",
+                   help="启用截面交叉注意力（需 --section-batch，模型需为 cnn）")
+    p.add_argument("--section-batch", action="store_true",
+                   help="按截面组织 batch（损失对齐 soft-IC，不改变模型结构）")
+    p.add_argument("--accum-steps", type=int, default=None,
+                   help="截面 batch 模式下的梯度累积步数")
     p.add_argument("--max-train-months", type=int, default=None,
                    help="只用训练月份列表中的前 N 个月（快速调试）")
     p.add_argument("--train-months", default=None,
@@ -122,6 +152,12 @@ def build_cfg(args) -> Config:
         cfg.lr = args.lr
     if args.device:
         cfg.device = args.device
+    if args.xsec:
+        cfg.use_xsec = True
+    if args.section_batch:
+        cfg.use_section_batch = True
+    if args.accum_steps:
+        cfg.accum_steps = args.accum_steps
     if cfg.smoke:
         cfg.epochs = min(cfg.epochs, 4)
         cfg.patience = min(cfg.patience, 2)
@@ -180,12 +216,28 @@ def main():
     print(f"[target] kind={args.target} "
           f"train mean={y_tr.mean():+.4f} std={y_tr.std():.4f}")
 
-    train_loader = DataLoader(
-        StockDataset(X_tr, y_tr), batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, drop_last=True, pin_memory=True)
-    val_loader = DataLoader(
-        StockDataset(X_va, y_va_fit), batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=True)
+    use_xsec = getattr(cfg, "use_xsec", False)
+    use_section_batch = getattr(cfg, "use_section_batch", False)
+    if use_xsec and not use_section_batch:
+        # 交叉注意力必须在截面内交互，强制开启截面 batch
+        use_section_batch = True
+    if use_section_batch:
+        train_loader = _section_loader(X_tr, y_tr, m_tr, cfg, device,
+                                       shuffle=True)
+        val_loader = _section_loader(X_va, y_va_fit, m_va, cfg, device,
+                                     shuffle=False)
+    else:
+        # 随机 batch：同样返回全局下标，使 predict 能按原顺序还原
+        train_loader = DataLoader(
+            StockDataset(X_tr, y_tr, return_idx=True),
+            batch_size=cfg.batch_size, shuffle=True,
+            num_workers=cfg.num_workers, drop_last=True,
+            pin_memory=True, collate_fn=collate_sections)
+        val_loader = DataLoader(
+            StockDataset(X_va, y_va_fit, return_idx=True),
+            batch_size=cfg.batch_size, shuffle=False,
+            num_workers=cfg.num_workers, pin_memory=True,
+            collate_fn=collate_sections)
 
     if cfg.model_arch == "cnn":
         model = CNNTransformerModel(cfg).to(device)
@@ -200,17 +252,22 @@ def main():
         optimizer, mode="max", factor=0.5, patience=2)
     criterion = get_loss(args.loss)
     print(f"[loss] {args.loss}")
+    print(f"[batch] section_batch={use_section_batch} xsec={use_xsec} "
+          f"accum_steps={cfg.accum_steps if use_section_batch else 1}")
 
     best_ic, wait = -np.inf, 0
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     for epoch in range(cfg.epochs):
+        accum = cfg.accum_steps if use_section_batch else 1
         tr_loss = train_one_epoch(model, train_loader, optimizer,
-                                  criterion, device, cfg.grad_clip)
+                                  criterion, device, cfg.grad_clip,
+                                  accum_steps=accum)
 
         # 训练集 IC（抽样，快速预警模型是否退化成常数输出）
         n_probe = min(len(X_tr), 100000)
-        tr_pred = predict(model, _sub_loader(X_tr[:n_probe], cfg, device),
+        tr_pred = predict(model, _sub_loader(X_tr[:n_probe], y_tr_raw[:n_probe],
+                                             m_tr[:n_probe], cfg, device),
                           device)
         tr_ic = compute_ic(tr_pred, y_tr_raw[:n_probe], m_tr[:n_probe])
 

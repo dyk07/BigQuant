@@ -117,13 +117,51 @@ def apply_scaler(X: np.ndarray, mean, std, inplace: bool = True):
     return out
 
 
+def make_section_batches(meta, min_stocks=10, shuffle=True, seed=42):
+    """按截面 (day, minute_of_day) 分组，每个 batch = 一个完整截面。
+
+    返回 list[np.ndarray]，每个数组是该截面样本的**全局下标**。
+    数组长度可不同（不同截面股票数不相等），由 batch_sampler + collate_fn
+    直接按截面 stack，无需 padding。
+
+    min_stocks 与 metrics.compute_ic 的阈值对齐：过小的截面在训练和评估中
+    同时被丢弃，避免出现 pred=NaN 污染评估。
+    """
+    df = pd.DataFrame({
+        "i": np.arange(len(meta), dtype=np.int64),
+        "day": [m[1] for m in meta],
+        "min": [m[2] for m in meta],
+    })
+    batches = [
+        g["i"].to_numpy()
+        for _, g in df.groupby(["day", "min"], sort=False)
+        if len(g) >= min_stocks
+    ]
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(batches)
+    return batches
+
+
+def collate_sections(batch):
+    """单个截面内 [..., (X, y, idx)] -> (X, y, idx)。"""
+    X = torch.stack([b[0] for b in batch], dim=0)          # [n, T, F]
+    y = torch.stack([b[1] for b in batch], dim=0)          # [n]
+    idx = torch.tensor([b[2] for b in batch], dtype=torch.long)
+    return X, y, idx
+
+
 class StockDataset(Dataset):
-    def __init__(self, X, y):
+    def __init__(self, X, y, return_idx=False):
         self.X = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32))
         self.y = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
+        self.return_idx = return_idx
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
+        if self.return_idx:
+            # 返回全局下标，供截面采样后的 predict 按原顺序还原
+            return self.X[idx], self.y[idx], idx
         return self.X[idx], self.y[idx]
