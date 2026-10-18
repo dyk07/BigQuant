@@ -19,7 +19,9 @@ NOTEBOOK_NAME = "Transformer_modelsave_predict.ipynb"
 SEC_RE = re.compile(r'(?m)^# ={20,}\n# (.+?)\n# ={20,}\n')
 CFG_KEYS = ["SEED", "FREQS", "LOOKBACK_MINUTES", "HORIZON_MINUTES",
             "SAMPLE_STEP_MINUTES", "INPUT_SAME_DAY_ONLY", "TRAIN_MONTHS",
-            "MODEL_CFG", "TRAIN_CFG"]
+            "MODEL_CFG", "TRAIN_CFG",
+            "USE_XSEC", "XSEC_LAYERS", "XSEC_HEADS",
+            "USE_TURNOVER", "LAMBDA_TURNOVER"]
 
 DRIVER = '''# ============================================================
 # 本地 / 演示入口

@@ -686,9 +686,10 @@ def build_features(df):
 def build_labels(df, horizon_bars):
     """标签 = end_price / future_vwap - 1, 窗口不跨交易日 (float32)。
 
-    平台 vwap_return 的真实定义是 **end_price / vwap - 1**(会议答疑确认:
-    "endprice / vwap - 1")。之前误写成 vwap / end_price - 1, 对小幅收益两者
-    近似互为相反数 -> 因子方向整体翻负(IC 全负)。这里改为平台口径。
+    与平台 vwap_return 定义完全一致: future_vwap 为未来窗口的 VWAP,
+    end_price 为未来窗口最后一根 bar 的收盘价 (close[t+h]), 则
+        label = end_price / future_vwap - 1
+    即"相对未来 VWAP 的收盘价溢价"。训练与推理方向统一, 无需取负/取反纠正。
     """
     grp = [df["instrument_id"], df["day"]]
     amt64 = df["amount"].astype("float64")
@@ -1327,7 +1328,7 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
                 if lcs.numel() >= 2:
                     to_corr = _corr_batch(p[lcs], p[lns])
                     loss = loss + lam_to * (1.0 - to_corr)
-                    tot_to += float(1.0 - to_corr); cnt_to += 1
+                    tot_to += float(1.0 - to_corr.detach()); cnt_to += 1
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)

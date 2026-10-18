@@ -105,12 +105,13 @@ python leak_control.py --month 202301 --seeds 5      # 防泄漏
 
 ## 4. 标签定义
 
-未来 `horizon_minutes`（默认 30）的 VWAP 收益：
+未来 `horizon_minutes`（默认 30）的收益：
 
 $$\text{future\_vwap} = \frac{\sum_{k=t+1}^{t+h} \text{amount}_k}{\sum_{k=t+1}^{t+h} \text{volume}_k},
-\qquad \text{label} = \frac{\text{future\_vwap}}{\text{close}_t} - 1$$
+\qquad \text{label} = \frac{\text{close}_{t+h}}{\text{future\_vwap}} - 1$$
 
-其中 $h = \text{horizon\_bars} = \text{horizon\_minutes} / \text{bar\_minutes}$：
+其中 $\text{close}_{t+h}$ 是未来窗口最后一根 bar 的收盘价（= end_price），
+$h = \text{horizon\_bars} = \text{horizon\_minutes} / \text{bar\_minutes}$：
 
 | 频率 | h（bar 数） |
 | --- | --- |
@@ -118,6 +119,10 @@ $$\text{future\_vwap} = \frac{\sum_{k=t+1}^{t+h} \text{amount}_k}{\sum_{k=t+1}^{
 | bar15m | 2 |
 | bar5m | 6 |
 | bar1m | 30 |
+
+✅ **与平台一致**：`label = end_price / future_vwap - 1`，与平台
+`vwap_return = end_price / vwap - 1` 定义完全相同，训练与推理方向统一，
+无需取负/取反纠正。
 
 约束：
 - 窗口**不跨交易日**（按 `instrument_id + day` 分组）

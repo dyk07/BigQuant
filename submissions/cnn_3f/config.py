@@ -60,7 +60,7 @@ TRAIN_CFG = dict(
 # 用 block-diagonal mask 限制注意力只在同 (day, minute) 截面内,
 # 因此在随机大 batch 下也保持截面语义正确, 不引入未来信息。
 # ======================================================================
-USE_XSEC = False          # 是否启用截面交叉注意力
+USE_XSEC = True           # 是否启用截面交叉注意力
 XSEC_LAYERS = 1           # 交叉注意力 Transformer 块数
 XSEC_HEADS = 4            # 交叉注意力头数
 

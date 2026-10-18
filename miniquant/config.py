@@ -15,9 +15,11 @@
 - 采样按**时钟分钟**对齐（aligned_minutes），不依赖每只股票的行号：
   四个频率都在 09:25,10:00,10:30,11:00,11:30,13:30,14:00,14:30,15:00 采样，
   即每个交易日 **8 个日内截面**（15:00 无未来窗口，不参与训练/评估）。
-- 标签严格按会议定义（end_price = 未来窗口最后一根 bar 的收盘价）：
-  label = future_vwap / close[t+h] - 1，
+- 标签（本地训练口径，end_price = 未来窗口最后一根 bar 的收盘价）：
+  label = end_price / future_vwap - 1，
   horizon_bars = 30 / bar_minutes（bar30m:1, bar15m:2, bar5m:6, bar1m:30）。
+  与平台 vwap_return = end_price / vwap - 1 定义完全一致，训练/推理方向统一，
+  无需取负/取反纠正。
 - 标签窗口严格限制在当日（不跨交易日）；输入窗口是否可跨日由
   input_same_day_only 控制。
 """

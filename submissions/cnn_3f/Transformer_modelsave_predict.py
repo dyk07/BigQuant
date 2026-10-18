@@ -90,9 +90,9 @@ def main(datasources, start_date, end_date):
                         torch.from_numpy(sec_ids[i:i + BATCH]).to(device))
                 preds.append(model(xb, sec_ids=sidb).cpu().numpy())
             out = idx_df.copy()
-            # 权重是按旧 label(vwap/end-1)训练的, 方向与平台 vwap_return=
-            # end/vwap-1 相反; 不重训, 直接对 factor 取负号纠正方向。
-            out["factor"] = (-np.concatenate(preds).astype(np.float64)
+            # 训练与推理 label 方向已统一为 end_price/vwap - 1, 直接输出预测分数,
+            # 无需取负/取反纠正方向。
+            out["factor"] = (np.concatenate(preds).astype(np.float64)
                              if preds else np.zeros(len(out)))
             parts.append(out)
             n_rows += len(out)

@@ -1,0 +1,23 @@
+/home/diamondpeach/miniconda3/envs/bigquant/lib/python3.9/site-packages/torch/nn/modules/transformer.py:392: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[notebook] code cells = 9
+  cell0: OK   (import types)
+  cell1: OK   (""")
+  cell2: OK   (# ==========================================================)
+  cell3: OK   (# ==========================================================)
+  cell4: OK   (# ==========================================================)
+  cell5: OK   (# ==========================================================)
+  cell6: OK   (# ==========================================================)
+  cell7: OK   (import gc)
+  cell8: OK   (# ==========================================================)
+
+[main] 输出 150,699 行, 列=['date', 'instrument', 'factor']
+               date  instrument    factor
+2024-12-02 11:30:00          12  2.222287
+2024-12-02 11:30:00          16 -5.534303
+2024-12-02 11:30:00          19 -8.205960
+2024-12-02 11:30:00          25 -1.692471
+2024-12-02 11:30:00          28 -2.142236
+2024-12-02 11:30:00          29 -9.393971
+  dates=151 instruments=1100 factor_mean=-1.4040
+OK

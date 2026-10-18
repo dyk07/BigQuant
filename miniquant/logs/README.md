@@ -17,6 +17,7 @@ logs/
 │   ├── full_secbatch_ab.log  # xsec 实验：截面 batch（无注意力）
 │   ├── full_xsec_ab.log      # xsec 实验（截面 batch + 交叉注意力）
 │   └── full_grouped_ab.log   # xsec 实验（分组大 batch + 交叉注意力）
+│   └── full_cnn3f_xsec_to.log# 多频 XSEC + 换手正则全量重训（新标签方向）
 └── <date>_<模型>.md          # 各版本模型记录（正式记录，纳入 git）
 ```
 
@@ -29,6 +30,7 @@ logs/
 | v3 | 2026-10-06 | 多频率融合 GRU（multifreq） | [2026-10-06_multifreq.md](./2026-10-06_multifreq.md) | 0.0363（4 频） |
 | v4 | 2026-10-09 | CNN+Transformer（单频） | [2026-10-09_cnn_bar30m.md](./2026-10-09_cnn_bar30m.md) | 0.0473 |
 | v5 | 2026-10-17 | 截面交叉注意力 A/B（单频） | [2026-10-17_xsec_ab.md](./2026-10-17_xsec_ab.md) | 0.0477（随机）/ 0.0402（截面 batch）/ 0.0426（xsec）/ 0.0436（分组 xsec） |
+| v6 | 2026-10-18 | 多频 XSEC + 换手正则 + 标签方向统一 | [2026-10-18_xsec_to_multifreq.md](./2026-10-18_xsec_to_multifreq.md) | 0.0757（XSEC+换手，新标签） |
 
 > 说明：各版本验证集口径不完全一致（采样截面数 / 样本数随配置演进有变化），
 > IC 数值只作趋势参考，不宜直接跨版本做严格排序比较；细节见各记录。
@@ -45,3 +47,5 @@ logs/
    单截面 batch 有害（−0.0075，梯度噪声）；分组大 batch 部分回收（+0.0010），
    但净效果仍低于随机 batch baseline。**单频弱信号下梯度稳定性 > 损失对齐**，
    截面注意力应转向多频（信号更强）验证（见 v5 记录）。
+5. **标签方向已统一为平台口径**（`end_price/future_vwap - 1`），推理侧不再取反；
+   多频 XSEC + 换手正则全量重训 best val_IC=0.0757（见 v6 记录）。

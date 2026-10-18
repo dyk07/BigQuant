@@ -182,12 +182,12 @@ def check_window_leakage(cfg: Config, months, n_check: int = 200, seed: int = 0)
         else:
             # ---- 3) 直接重算标签并与 build_labels 对比 ----
             # 自动兼容午休跨越、零成交分钟等情形，是最强的正确性校验。
-            # 标签 = future_vwap / end_price - 1，end_price = 未来窗口最后
+            # 标签 = end_price / future_vwap - 1，end_price = 未来窗口最后
             # 一根 bar 的 close，即 close_arr[pos + h]（hi = pos + h + 1）。
             v = vol_arr[lo:hi].sum()
             fv = amt_arr[lo:hi].sum() / v if v > 0 else np.nan
             end_px = close_arr[hi - 1]
-            recomputed = (fv / end_px - 1.0) if end_px > 0 else np.nan
+            recomputed = (end_px / fv - 1.0) if (end_px > 0 and np.isfinite(fv)) else np.nan
             stored = label_arr[pos]
             if np.isnan(recomputed) != np.isnan(stored) or (
                     not np.isnan(recomputed) and

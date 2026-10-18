@@ -23,14 +23,12 @@
 **为何不把"零报价"当特征**: 平台规则禁止手工因子（尤其买卖量不平衡类），
   涨跌停标记属于人工构造的因子，故统一按缺失处理，让模型自行从价格/量序列学习。
 
-### 2. 标签定义错误 (CRITICAL — 已修复)
+### 2. 标签定义 (CRITICAL — 方向已定案)
 **会议纪要**: "WAP收益是用未来30分钟的成交量加权平均价除以未来30分钟窗口的**最终一笔成交价（end_price）**计算得出"
-**解读**: label = future_vwap / close[t+h] - 1  (h=horizon_bars)
-**此前实现**: label = future_vwap / close[t] - 1  ← 分母是当前 bar 的 close
-**实测影响**: Spearman(label_ours, label_mtg) = **-0.36 ~ -0.39**（四个频率一致）
-  — 不仅是量纲差异，排序都反了！std 也从 0.009 缩到 0.0058。
-**修复**: `features.py/build_labels()` 分母改为 `close[t+h]`（end_price），
-  并把 `end_price` 一并写入 df 供核对。
+**平台真实口径(用户最终确认)**: `vwap_return = end_price / vwap - 1`
+**本地训练口径(已统一)**: `label = end_price / future_vwap - 1`（与平台定义完全一致）
+**方向处理**: 训练与推理方向统一，**不再**在推理侧 factor 取负号；此前的
+  `vwap/end-1` + 推理取负 的临时方案已撤销。
 
 ### 3. 09:25 集合竞价 (IMPORTANT — 已修复)
 **现象**: 09:25 bar 在**四个频率中都存在**，且约 40% 股票有真实成交

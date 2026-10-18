@@ -44,12 +44,12 @@
   即每个交易日 **8 个可用日内截面**（尾盘 15:00 无未来窗口，标签为 NaN 故不采）
 
 ## 3. 标签
-未来 30 分钟 VWAP 收益（严格按平台会议定义，end_price = 未来窗口最后一根 bar 的收盘价）：
+未来 30 分钟收益（end_price = 未来窗口最后一根 bar 的收盘价）：
 - future_vwap = sum(amount[t+1..t+h]) / sum(volume[t+1..t+h])
-- **label = future_vwap / close[t+h] - 1**   （分母是 end_price，不是 close[t]）
+- **本地训练 label = close[t+h] / future_vwap - 1**（分子是 end_price）
 - h = horizon_minutes / bar_minutes → bar30m:1, bar15m:2, bar5m:6, bar1m:30
-- ⚠️ 原实现用 close[t] 作分母，与平台定义算出的标签 Spearman ≈ **-0.38**
-  （排序都不一样，不只是量纲差异），已修正为 close[t+h]
+- ✅ **与平台 vwap_return = end_price / vwap - 1 定义完全一致**，
+  训练与推理方向统一，无需取负/取反纠正。
 - 窗口不跨交易日；仅要求窗口内**存在成交**（fwd_vol > 0），
   不要求每根 bar 都有成交（零成交分钟对 VWAP 分子分母贡献均为 0；
   该放宽使 bar1m 标签有效率从 74.8% 升到 87.4%）
