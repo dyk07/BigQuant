@@ -985,10 +985,47 @@ def _corr_batch(p, y):
 
     注意: eps 放在 sqrt **内部**, 否则当 p/y 均为常数 (方差=0) 时,
     sqrt(0) 的反向会得到 inf*0 = NaN 梯度 (如换手正则的单元素配对)。
+
+    另: 前向在 autocast(fp16/bf16) 下 p/y 可能是低精度张量, 这里先 .float()
+    升回 fp32, 保证 corr 与梯度的数值精度不受混合精度影响。
     """
+    p = p.float(); y = y.float()
     pc = p - p.mean(); yc = y - y.mean()
     denom = torch.sqrt((pc ** 2).sum() * (yc ** 2).sum() + 1e-8)
     return (pc * yc).sum() / denom
+
+
+def _grouped_corr(p, y, sidb):
+    """按截面分组求 corr 再平均 (向量化, 替代逐 group 串行循环)。
+
+    用 scatter_add 一次归约所有 group 的 sum/count/sumsq, 与逐 group 的
+    `_corr_batch` 数值及梯度一致 (对拍误差 < 1e-8)。有效 group (<2 样本)
+    不计入, 全部无效时退化为整 batch corr。返回标量均值。
+    """
+    p = p.float(); y = y.float()
+    ids = torch.unique(sidb)
+    gid = torch.searchsorted(ids, sidb)                 # 连续 id 0..G-1
+    G = ids.numel()
+    cnt = torch.bincount(gid, minlength=G).float()      # [G]
+    sp = torch.zeros(G, device=p.device, dtype=p.dtype)
+    sy = torch.zeros(G, device=p.device, dtype=p.dtype)
+    sp.scatter_add_(0, gid, p)
+    sy.scatter_add_(0, gid, y)
+    mp = sp / cnt
+    my = sy / cnt
+    pc = p - mp[gid]
+    yc = y - my[gid]
+    ssp = torch.zeros(G, device=p.device, dtype=p.dtype)
+    ssy = torch.zeros(G, device=p.device, dtype=p.dtype)
+    sxy = torch.zeros(G, device=p.device, dtype=p.dtype)
+    ssp.scatter_add_(0, gid, pc * pc)
+    ssy.scatter_add_(0, gid, yc * yc)
+    sxy.scatter_add_(0, gid, pc * yc)
+    corrs = sxy / torch.sqrt(ssp * ssy + 1e-8)          # [G]
+    valid = cnt >= 2
+    if valid.sum() == 0:
+        return _corr_batch(p, y)
+    return corrs[valid].mean()
 
 
 def _section_ids(keys):
@@ -1240,6 +1277,17 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, factor=tc["lr_factor"], patience=tc["lr_patience"])
 
+    # ---- 混合精度 (AMP) ----
+    # float16 需要 GradScaler 防下溢; bfloat16 动态范围与 fp32 一致, 无需 scaler。
+    # CPU / 无 CUDA 时自动关闭 (dtype 回退 fp32)。
+    use_amp = bool(getattr(CFG, "USE_AMP", False)) and device.type == "cuda"
+    amp_dtype = {"float16": torch.float16,
+                 "bfloat16": torch.bfloat16}.get(
+        str(getattr(CFG, "AMP_DTYPE", "float16")), torch.float16)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+    if use_amp:
+        print(f"  [amp] enabled dtype={amp_dtype}")
+
     n = len(ytr)
     ytr_t = torch.from_numpy(ytr)
     buf = {f: np.empty((batch, int(seq_lens[f]), N_FEATURES), "float32")
@@ -1302,37 +1350,40 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
                 torch.from_numpy(sec_ids_tr[idxb]).to(device)
 
             opt.zero_grad()
-            p = model(xb, sec_ids=sidb)
+            # AMP: 前向 + 损失在 autocast 上下文中; 损失内部 _corr_batch 已 .float(),
+            # 故 loss 数值与梯度精度不受低精度前向影响。
+            with torch.autocast(device_type="cuda", dtype=amp_dtype,
+                                enabled=use_amp):
+                p = model(xb, sec_ids=sidb)
 
-            # 主损失: 与评估截面 IC 对齐。启用截面注意力时改为"组内 corr 再平均",
-            # 避免随机大 batch 把多个截面混在一起做 Pearson 造成的偏差。
-            if use_xsec:
-                loss = 0.0
-                cnt = 0
-                for g in torch.unique(sidb):
-                    m = sidb == g
-                    if m.sum() < 2:
-                        continue
-                    loss = loss + (1.0 - _corr_batch(p[m], yb[m]))
-                    cnt += 1
-                loss = loss / max(cnt, 1) if cnt else (1.0 - _corr_batch(p, yb))
+                # 主损失: 与评估截面 IC 对齐。启用截面注意力时改为"组内 corr 再平均",
+                # 避免随机大 batch 把多个截面混在一起做 Pearson 造成的偏差。
+                if use_xsec:
+                    loss = 1.0 - _grouped_corr(p, yb, sidb)
+                else:
+                    loss = 1.0 - _corr_batch(p, yb)
+
+                # 换手正则: 1 - corr(p_cur, p_next), 同一股票相邻截面分数相关越高,
+                # 相对排序越稳定 -> 换手越低。
+                if pair_by_s and s in pair_by_s:
+                    lcs = torch.tensor([a for a, _ in pair_by_s[s]], device=device)
+                    lns = torch.tensor([b for _, b in pair_by_s[s]], device=device)
+                    # 至少 2 对才构成有意义的时序相关 (单对退化为零方差 -> 无梯度)
+                    if lcs.numel() >= 2:
+                        to_corr = _corr_batch(p[lcs], p[lns])
+                        loss = loss + lam_to * (1.0 - to_corr)
+                        tot_to += float(1.0 - to_corr.detach()); cnt_to += 1
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(opt)
+                scaler.update()
             else:
-                loss = 1.0 - _corr_batch(p, yb)
-
-            # 换手正则: 1 - corr(p_cur, p_next), 同一股票相邻截面分数相关越高,
-            # 相对排序越稳定 -> 换手越低。
-            if pair_by_s and s in pair_by_s:
-                lcs = torch.tensor([a for a, _ in pair_by_s[s]], device=device)
-                lns = torch.tensor([b for _, b in pair_by_s[s]], device=device)
-                # 至少 2 对才构成有意义的时序相关 (单对退化为零方差 -> 无梯度)
-                if lcs.numel() >= 2:
-                    to_corr = _corr_batch(p[lcs], p[lns])
-                    loss = loss + lam_to * (1.0 - to_corr)
-                    tot_to += float(1.0 - to_corr.detach()); cnt_to += 1
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            opt.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                opt.step()
             tot += float(loss); nb += 1
 
         ic = _eval_ic(model, va["feats"], va["anchors"], seq_lens,

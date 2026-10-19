@@ -21,7 +21,8 @@ CFG_KEYS = ["SEED", "FREQS", "LOOKBACK_MINUTES", "HORIZON_MINUTES",
             "SAMPLE_STEP_MINUTES", "INPUT_SAME_DAY_ONLY", "TRAIN_MONTHS",
             "MODEL_CFG", "TRAIN_CFG",
             "USE_XSEC", "XSEC_LAYERS", "XSEC_HEADS",
-            "USE_TURNOVER", "LAMBDA_TURNOVER"]
+            "USE_TURNOVER", "LAMBDA_TURNOVER",
+            "USE_AMP", "AMP_DTYPE"]
 
 DRIVER = '''# ============================================================
 # 本地 / 演示入口
