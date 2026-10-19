@@ -16,8 +16,10 @@ logs/
 │   ├── full_base_xsec_ab.log # xsec 实验 baseline（随机 batch 对照）
 │   ├── full_secbatch_ab.log  # xsec 实验：截面 batch（无注意力）
 │   ├── full_xsec_ab.log      # xsec 实验（截面 batch + 交叉注意力）
-│   └── full_grouped_ab.log   # xsec 实验（分组大 batch + 交叉注意力）
-│   └── full_cnn3f_xsec_to.log# 多频 XSEC + 换手正则全量重训（新标签方向）
+│   ├── full_grouped_ab.log   # xsec 实验（分组大 batch + 交叉注意力）
+│   ├── full_cnn3f_xsec_to.log# 多频 XSEC + 换手正则全量重训（新标签方向）
+│   ├── full_cnn3f_amp.log    # AMP 混合精度全量重训（96.6min）
+│   └── full_cnn3f_hidden96.log# hidden 加宽 64->96 全量重训（负贡献）
 └── <date>_<模型>.md          # 各版本模型记录（正式记录，纳入 git）
 ```
 
@@ -32,6 +34,8 @@ logs/
 | v5 | 2026-10-17 | 截面交叉注意力 A/B（单频） | [2026-10-17_xsec_ab.md](./2026-10-17_xsec_ab.md) | 0.0477（随机）/ 0.0402（截面 batch）/ 0.0426（xsec）/ 0.0436（分组 xsec） |
 | v6 | 2026-10-18 | 多频 XSEC + 换手正则 + 标签方向统一 | [2026-10-18_xsec_to_multifreq.md](./2026-10-18_xsec_to_multifreq.md) | 0.0757（XSEC+换手，新标签） |
 | v7 | 2026-10-18 | AMP 混合精度 + 训练效率优化 | [2026-10-18_amp_efficiency.md](./2026-10-18_amp_efficiency.md) | 0.0767（96.6min，5.3×提速） |
+| v8 | 2026-10-19 | hidden 加宽 A/B（64→96） | [2026-10-19_hidden_width.md](./2026-10-19_hidden_width.md) | 0.0713（负贡献，已回滚） |
+| v9 | 2026-10-19 | 公榜回退诊断 + 提交历史归档 | [2026-10-19_regression_diagnosis.md](./2026-10-19_regression_diagnosis.md) | 高分 0.0886 对应干净基线 |
 
 > 说明：各版本验证集口径不完全一致（采样截面数 / 样本数随配置演进有变化），
 > IC 数值只作趋势参考，不宜直接跨版本做严格排序比较；细节见各记录。
@@ -50,3 +54,7 @@ logs/
    截面注意力应转向多频（信号更强）验证（见 v5 记录）。
 5. **标签方向已统一为平台口径**（`end_price/future_vwap - 1`），推理侧不再取反；
    多频 XSEC + 换手正则全量重训 best val_IC=0.0757（见 v6 记录）。
+6. **AMP 混合精度带来 5.3× 训练提速**（510.9→96.6min），且 IC 不降（0.0767），
+   是后续所有实验的默认配置（见 v7 记录）。
+7. **「扩大参数量」方向证伪**：hidden 64→96 全量 best val_IC 0.0767→0.0713，
+   负贡献且更快过拟合。瓶颈是弱信号 + 数据量，而非模型容量（见 v8 记录）。

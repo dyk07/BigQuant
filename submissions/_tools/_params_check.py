@@ -1,9 +1,11 @@
 import torch
 from Transformer_modelsave_train import build_model
+import config as CFG
 
-mc = dict(arch="multi", freqs=["bar30m", "bar15m", "bar5m"], in_dim=25,
-          hidden=64, conv_blocks=3, kernel=3, transformer_layers=2, heads=4,
-          dropout=0.2, fused_dim=64, use_xsec=True, xsec_layers=1, xsec_heads=4)
+mc = dict(arch="multi", freqs=["bar30m", "bar15m", "bar5m"], **CFG.MODEL_CFG,
+          use_xsec=bool(getattr(CFG, "USE_XSEC", False)),
+          xsec_layers=int(getattr(CFG, "XSEC_LAYERS", 1)),
+          xsec_heads=int(getattr(CFG, "XSEC_HEADS", 4)))
 m = build_model(mc)
 n = sum(p.numel() for p in m.parameters() if p.requires_grad)
 print("params =", n, "= %.2fM" % (n / 1e6))
