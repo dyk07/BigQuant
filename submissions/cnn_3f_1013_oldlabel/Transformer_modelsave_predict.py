@@ -62,7 +62,11 @@ def main(datasources, start_date, end_date):
     model = build_model(ckpt["model_cfg"]).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
-    logger.info("已加载模型", path=MODEL_PATH, freqs=freqs, device=str(device))
+    # 方向标记: 旧方向权重 (label_direction=vwap_over_end) 需 factor 取负,
+    # 对齐平台 label=end_price/vwap-1 的口径。
+    factor_sign = -1.0 if ckpt.get("label_direction") == "vwap_over_end" else 1.0
+    logger.info("已加载模型", path=MODEL_PATH, freqs=freqs, device=str(device),
+                factor_sign=factor_sign)
 
     # ---------- 推理 (样本外测试区间) ----------
     logger.info("构建测试集并预测", start=str(start_date), end=str(end_date))
@@ -76,7 +80,7 @@ def main(datasources, start_date, end_date):
         for i in range(0, len(idx_df), BATCH):
             xb = [t[i:i + BATCH].to(device) for t in Xt]
             preds.append(model(xb).cpu().numpy())
-    idx_df["factor"] = (np.concatenate(preds).astype(np.float64)
+    idx_df["factor"] = ((np.concatenate(preds).astype(np.float64) * factor_sign)
                         if preds else np.zeros(len(idx_df)))
 
     # ---------- 对齐中证 1000 + 规范输出 ----------

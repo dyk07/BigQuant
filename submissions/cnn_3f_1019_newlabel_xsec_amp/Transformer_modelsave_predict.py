@@ -65,8 +65,12 @@ def main(datasources, start_date, end_date):
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     use_xsec = bool(ckpt.get("model_cfg", {}).get("use_xsec", False))
+    # 方向标记: 权重 json 里的 label_direction 决定 factor 是否取负。
+    #   * "end_over_vwap" (平台正确 label=end_price/vwap-1): 不取负;
+    #   * "vwap_over_end" (旧方向权重, 排序相反): factor 取负以对齐平台口径。
+    factor_sign = -1.0 if ckpt.get("label_direction") == "vwap_over_end" else 1.0
     logger.info("已加载模型", path=MODEL_PATH, freqs=freqs, device=str(device),
-                use_xsec=use_xsec)
+                use_xsec=use_xsec, factor_sign=factor_sign)
 
     # ---------- 推理 (逐月流式, 峰值内存 ~1 个月) ----------
     logger.info("逐月构建测试集并预测", start=str(start_date), end=str(end_date))
@@ -90,9 +94,9 @@ def main(datasources, start_date, end_date):
                         torch.from_numpy(sec_ids[i:i + BATCH]).to(device))
                 preds.append(model(xb, sec_ids=sidb).cpu().numpy())
             out = idx_df.copy()
-            # 训练与推理 label 方向已统一为 end_price/vwap - 1, 直接输出预测分数,
-            # 无需取负/取反纠正方向。
-            out["factor"] = (np.concatenate(preds).astype(np.float64)
+            # 训练与推理 label 方向已统一为 end_price/vwap - 1; 旧方向权重
+            # (label_direction=vwap_over_end) 需乘 -1 对齐平台口径。
+            out["factor"] = ((np.concatenate(preds).astype(np.float64) * factor_sign)
                              if preds else np.zeros(len(out)))
             parts.append(out)
             n_rows += len(out)

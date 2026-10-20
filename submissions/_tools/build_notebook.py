@@ -13,7 +13,19 @@ import re
 ROOT = "/mnt/c/Users/Kelvin/Documents/GitHub/BigQuant"
 SUB = os.path.join(ROOT, "submissions")
 
-PACKAGES = ["cnn_1f_bar30m", "cnn_2f", "cnn_3f"]
+PACKAGES = [
+    "cnn_1f_1013_oldlabel",
+    "cnn_1f_1018_newlabel",
+    "cnn_1f_bar30m",
+    "cnn_2f",
+    "cnn_2f_1013_oldlabel",
+    "cnn_2f_1018_newlabel",
+    "cnn_3f",
+    "cnn_3f_1013_oldlabel",
+    "cnn_3f_1017_baseline_highscore",
+    "cnn_3f_1018_newlabel_xsec",
+    "cnn_3f_1019_newlabel_xsec_amp",
+]
 NOTEBOOK_NAME = "Transformer_modelsave_predict.ipynb"
 
 SEC_RE = re.compile(r'(?m)^# ={20,}\n# (.+?)\n# ={20,}\n')
@@ -78,7 +90,8 @@ def build_config_cell(config_py):
            "# ======================================================================\n",
            "CFG = types.SimpleNamespace(\n"]
     for k in CFG_KEYS:
-        out.append(f"    {k}={ns[k]!r},\n")
+        if k in ns:
+            out.append(f"    {k}={ns[k]!r},\n")
     out.append(")\n")
     return code_cell("".join(out))
 

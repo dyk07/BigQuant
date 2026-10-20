@@ -64,7 +64,11 @@ def main(datasources, start_date, end_date):
     model = build_model(ckpt["model_cfg"]).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
-    logger.info("已加载模型", path=MODEL_PATH, freqs=freqs, device=str(device))
+    # 方向标记: 旧方向权重 (label_direction=vwap_over_end) 需 factor 取负,
+    # 对齐平台 label=end_price/vwap-1 的口径。
+    factor_sign = -1.0 if ckpt.get("label_direction") == "vwap_over_end" else 1.0
+    logger.info("已加载模型", path=MODEL_PATH, freqs=freqs, device=str(device),
+                factor_sign=factor_sign)
 
     # ---------- 推理 (逐月流式, 峰值内存 ~1 个月) ----------
     logger.info("逐月构建测试集并预测", start=str(start_date), end=str(end_date))
@@ -82,7 +86,7 @@ def main(datasources, start_date, end_date):
                 xb = [t[i:i + BATCH].to(device) for t in Xt]
                 preds.append(model(xb).cpu().numpy())
             out = idx_df.copy()
-            out["factor"] = (np.concatenate(preds).astype(np.float64)
+            out["factor"] = ((np.concatenate(preds).astype(np.float64) * factor_sign)
                              if preds else np.zeros(len(out)))
             parts.append(out)
             n_rows += len(out)
