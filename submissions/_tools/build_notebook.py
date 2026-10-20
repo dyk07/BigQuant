@@ -25,6 +25,7 @@ PACKAGES = [
     "cnn_3f_1017_baseline_highscore",
     "cnn_3f_1018_newlabel_xsec",
     "cnn_3f_1019_newlabel_xsec_amp",
+    "cnn_3f_1020_newlabel_to0005",
 ]
 NOTEBOOK_NAME = "Transformer_modelsave_predict.ipynb"
 

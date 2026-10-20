@@ -1213,7 +1213,7 @@ def _batch_windows(feats, anchors, row_idx, seq_lens, freqs, buf=None):
 
 def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
                  epochs=None, lr=None, batch=None, patience=None,
-                 weight_decay=None, val_months=None):
+                 weight_decay=None, val_months=None, lam_turnover=None):
     """在给定 1 分钟表上训练多频模型, 返回 (model, stats, model_cfg)。
 
     数据侧**分月流式**构造 (见 `_accumulate`): 训练集与验证集各扫一遍自己的月份,
@@ -1296,15 +1296,15 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
 
     use_xsec = bool(getattr(CFG, "USE_XSEC", False))
     use_turnover = bool(getattr(CFG, "USE_TURNOVER", False))
-    lam_to = float(getattr(CFG, "LAMBDA_TURNOVER", 0.01))
+    lam_to = (float(getattr(CFG, "LAMBDA_TURNOVER", 0.01))
+              if lam_turnover is None else float(lam_turnover))
 
     # 截面编号 (训练周期仅算一次)
     sec_ids_tr = _section_ids(tr["keys"]) if use_xsec else None
 
     # 换手"下一截面"配对 (全局下标, 仅算一次): cur -> 同 (instrument, day) 的
-    # 下一采样截面。随机 batch 会打散, 只有 cur 与 next 落在同一 batch 时才能
-    # 直接算平滑相关; 该配对在 epoch 开始时按 perm 位置预先归类, 避免逐 batch
-    # 做 O(n) 成员判断。
+    # 下一采样截面。独立配对 batch: 每 epoch 采样一批 (cur, next) 对, 换手 loss
+    # 100% 命中, 不受随机 batch 打散影响 (原随机 batch 命中率仅 ~1.4%)。
     cur_tr = nxt_tr = None
     if use_turnover:
         nxt_all = _turnover_next(tr["keys"])
@@ -1312,6 +1312,7 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
         cur_tr = np.where(valid)[0].astype("int64")
         nxt_tr = nxt_all[valid].astype("int64")
         del nxt_all, valid
+    n_pair = len(cur_tr) if cur_tr is not None else 0
 
     best, best_state, bad = -9e9, None, 0
 
@@ -1322,23 +1323,14 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
         tot = 0.0; nb = 0
         tot_to = 0.0; cnt_to = 0
 
-        # 换手: 按本 epoch 的随机排列, 找出"cur 与 next 落在同一 batch"的配对,
-        # 记录其 batch 起始下标 s 与该 batch 内的局部下标 (lcur, lnxt)。
-        pair_by_s = None
-        if use_turnover and cur_tr is not None:
-            pos = np.empty(n, "int64")
-            pos[perm_np] = np.arange(n)
-            bcur = pos[cur_tr] // batch
-            bnxt = pos[nxt_tr] // batch
-            same = bcur == bnxt
-            if same.any():
-                scur = pos[cur_tr[same]]
-                snxt = pos[nxt_tr[same]]
-                bs = (scur // batch) * batch
-                pair_by_s = {}
-                for s0, lc, ln in zip(bs, scur % batch, snxt % batch):
-                    pair_by_s.setdefault(int(s0), []).append((int(lc), int(ln)))
-            del pos
+        # 换手独立配对 batch: 每 epoch 均匀采样 k 对 (cur, next) 作为额外的
+        # 前向 step (不更新主损失方向, 只叠加换手正则)。命中率 100%。
+        to_cur = to_nxt = None
+        if use_turnover and n_pair >= 2:
+            k = min(n_pair, batch // 2)
+            sel = np.random.permutation(n_pair)[:k]
+            to_cur = cur_tr[sel]
+            to_nxt = nxt_tr[sel]
 
         for s in range(0, n, batch):
             idxb = perm_np[s:s + batch]
@@ -1363,17 +1355,6 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
                 else:
                     loss = 1.0 - _corr_batch(p, yb)
 
-                # 换手正则: 1 - corr(p_cur, p_next), 同一股票相邻截面分数相关越高,
-                # 相对排序越稳定 -> 换手越低。
-                if pair_by_s and s in pair_by_s:
-                    lcs = torch.tensor([a for a, _ in pair_by_s[s]], device=device)
-                    lns = torch.tensor([b for _, b in pair_by_s[s]], device=device)
-                    # 至少 2 对才构成有意义的时序相关 (单对退化为零方差 -> 无梯度)
-                    if lcs.numel() >= 2:
-                        to_corr = _corr_batch(p[lcs], p[lns])
-                        loss = loss + lam_to * (1.0 - to_corr)
-                        tot_to += float(1.0 - to_corr.detach()); cnt_to += 1
-
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -1386,12 +1367,44 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
                 opt.step()
             tot += float(loss); nb += 1
 
+        # ---- 换手独立配对 step (100% 命中) ----
+        # 采样一批 (cur, next) 配对做一次额外前向, 叠加 λ·(1 - corr(p_cur, p_next))。
+        # 独立于主 batch, 不扰动主损失方向。
+        if use_turnover and to_cur is not None and to_nxt is not None:
+            xc = _batch_windows(tr["feats"], tr["anchors"], to_cur, seq_lens,
+                                freqs, buf=None)
+            xn = _batch_windows(tr["feats"], tr["anchors"], to_nxt, seq_lens,
+                                freqs, buf=None)
+            xcb = [torch.from_numpy(x).to(device) for x in xc]
+            xnb = [torch.from_numpy(x).to(device) for x in xn]
+            opt.zero_grad()
+            with torch.autocast(device_type="cuda", dtype=amp_dtype,
+                                enabled=use_amp):
+                pc = model(xcb, sec_ids=None)
+                pn = model(xnb, sec_ids=None)
+                to_corr = _corr_batch(pc, pn)
+                to_loss = lam_to * (1.0 - to_corr)
+            if scaler is not None:
+                scaler.scale(to_loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                to_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                opt.step()
+            tot_to += float(1.0 - to_corr.detach()); cnt_to += 1
+
         ic = _eval_ic(model, va["feats"], va["anchors"], seq_lens,
                       yva_raw, vkeys, freqs, device)
         sched.step(-ic)
         msg = f"  ep{ep+1:02d} loss={tot/max(nb,1):.4f} val_IC={ic:+.4f}"
         if use_turnover:
             msg += f" turnover={tot_to/max(cnt_to,1):.4f}"
+            vto = _eval_turnover(model, va["feats"], va["anchors"], seq_lens,
+                                 freqs, vkeys, device)
+            msg += f" val_turnover={vto:.4f}"
         print(msg)
         if ic > best:
             best, bad = ic, 0
@@ -1450,13 +1463,43 @@ def _eval_ic(model, feats, anchors, seq_lens, y, keys, freqs, device, batch=4096
     return float(np.mean(ics)) if ics else 0.0
 
 
+@torch.no_grad()
+def _eval_turnover(model, feats, anchors, seq_lens, freqs, keys, device,
+                   batch=4096):
+    """验证集换手指标: 同一只股票相邻截面的因子「排名变化」均值 (越低越好)。
+
+    口径: 对每只股票按 (instrument, day) 分组, 组内按截面时间排序, 相邻截面的
+    因子排名之差的绝对值求和取平均 (排名按全局截面内归一化到 [0,1] 后衡量)。
+    与平台"换手率=信号变化/调仓成本"方向一致 (低换手更好)。
+    """
+    preds = _predict_all(model, feats, anchors, seq_lens, freqs, keys,
+                         device, batch=batch)
+    n = len(keys)
+    df = pd.DataFrame({
+        "inst": keys[:, 0], "day": keys[:, 1], "mod": keys[:, 2], "p": preds,
+    })
+    # 截面内百分位 (平均名次), 归一化到 [0, 1]
+    df["p_rank"] = df.groupby(["day", "mod"], sort=False)["p"].rank(pct=True)
+    total_diff = 0.0
+    n_trans = 0
+    for _, g in df.groupby(["inst", "day"], sort=False):
+        if len(g) < 2:
+            continue
+        g = g.sort_values("mod")
+        d = np.abs(np.diff(g["p_rank"].to_numpy()))
+        total_diff += float(d.sum())
+        n_trans += len(d)
+    return float(total_diff / n_trans) if n_trans else float("nan")
+
+
 def train_and_save(datasources, train_months=None, freqs=None,
-                   model_path=MODEL_PATH):
+                   model_path=MODEL_PATH, lam_turnover=None):
     """
     从零训练并保存 transformer_model.json(私榜重训亦调用本函数)。
 
     train_months: 训练月份列表; 默认 config.TRAIN_MONTHS (2020-01 .. 2023-12)。
     freqs:        参与建模的频率; 默认 config.FREQS。
+    lam_turnover: 换手正则权重 (覆盖 config.LAMBDA_TURNOVER; None 用 config 值)。
 
     内存: 数据全程按月流式, 不物化滑窗矩阵; 峰值由 "一个月的 bar1m + 各频率
     特征矩阵" 决定, 远低于平台 51200MB 硬限制。
@@ -1467,13 +1510,18 @@ def train_and_save(datasources, train_months=None, freqs=None,
         freqs = CFG.FREQS
     train_months = sorted(str(m) for m in train_months)
 
+    # 实际生效的换手正则权重 (与 _train_freqs 内部一致, 供 payload 自描述)
+    lam_to = (float(getattr(CFG, "LAMBDA_TURNOVER", 0.01))
+              if lam_turnover is None else float(lam_turnover))
+
     table = datasources["bar1m"]
     print(f"[train] 分月流式读取 {len(train_months)} 个月 bar1m ... seed={SEED}")
 
     # 各频率输入窗口 bar 数 = LOOKBACK_MINUTES / bar 长度
     seq_lens = {f: max(1, CFG.LOOKBACK_MINUTES // FREQ_MINUTES[f]) for f in freqs}
     model, stats, model_cfg = _train_freqs(
-        table, train_months, list(freqs), seq_lens, ALIGNED_MINUTES, seed=SEED)
+        table, train_months, list(freqs), seq_lens, ALIGNED_MINUTES, seed=SEED,
+        lam_turnover=lam_turnover)
 
     payload = {
         "format": "miniquant-transformer-v1",
@@ -1490,7 +1538,8 @@ def train_and_save(datasources, train_months=None, freqs=None,
         "train_cfg": dict(CFG.TRAIN_CFG),
         "use_xsec": bool(getattr(CFG, "USE_XSEC", False)),
         "use_turnover": bool(getattr(CFG, "USE_TURNOVER", False)),
-        "lambda_turnover": float(getattr(CFG, "LAMBDA_TURNOVER", 0.01)),
+        "lambda_turnover": lam_to,
+        "label_direction": "end_over_vwap",  # label = end_price/vwap - 1 (新方向, 不取负)
         "lookback_minutes": int(CFG.LOOKBACK_MINUTES),
         "horizon_minutes": int(CFG.HORIZON_MINUTES),
         "sort_key": 1,           # resample/make_anchors 已按时间排序

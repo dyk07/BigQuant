@@ -27,6 +27,7 @@
 | 2 | 10-18 | `cnn_2f_1018_newlabel` | 0.0890 | 1.5082 | 40.0046 | 1.6092 | 0.6156 | 两频 newlabel（权重实为旧方向） |
 | 3 | 10-18 | `cnn_3f_1018_newlabel_xsec` | 0.0642 | 1.0535 | 31.0108 | 0.8910 | 0.6466 | +XSEC（回退版） |
 | 4 | 10-19 | `cnn_3f_1019_newlabel_xsec_amp` | 0.0631 | 0.9501 | 26.3558 | 0.7951 | 0.4934 | +XSEC+换手+AMP（回退版） |
+| 5 | 10-20 | `cnn_3f_1020_newlabel_to0005` | — | — | — | — | — | 关XSEC+λ=0.005，本地 val_IC=0.1099（待公榜） |
 
 <!-- 新 submission 请在上表追加一行，格式：
 | N | YYYY-MM-DD | submissions/ 目录名 | ic_mean | ic_ir | sharpe | stress | turnover | 备注 |

@@ -70,7 +70,7 @@ AMP_DTYPE = "float16"     # 前向精度: "float16" (需 GradScaler) / "bfloat16
 # 用 block-diagonal mask 限制注意力只在同 (day, minute) 截面内,
 # 因此在随机大 batch 下也保持截面语义正确, 不引入未来信息。
 # ======================================================================
-USE_XSEC = True           # 是否启用截面交叉注意力
+USE_XSEC = False          # 是否启用截面交叉注意力 (换手 λ 扫描实验: 关闭以隔离变量)
 XSEC_LAYERS = 1           # 交叉注意力 Transformer 块数
 XSEC_HEADS = 4            # 交叉注意力头数
 
