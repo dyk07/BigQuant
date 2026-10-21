@@ -26,6 +26,7 @@ PACKAGES = [
     "cnn_3f_1018_newlabel_xsec",
     "cnn_3f_1019_newlabel_xsec_amp",
     "cnn_3f_1020_newlabel_to0005",
+    "cnn_3f_1020_swa",
 ]
 NOTEBOOK_NAME = "Transformer_modelsave_predict.ipynb"
 
@@ -35,7 +36,8 @@ CFG_KEYS = ["SEED", "FREQS", "LOOKBACK_MINUTES", "HORIZON_MINUTES",
             "MODEL_CFG", "TRAIN_CFG",
             "USE_XSEC", "XSEC_LAYERS", "XSEC_HEADS",
             "USE_TURNOVER", "LAMBDA_TURNOVER",
-            "USE_AMP", "AMP_DTYPE"]
+            "USE_AMP", "AMP_DTYPE",
+            "USE_SWA", "SWA_START_EPOCH"]
 
 DRIVER = '''# ============================================================
 # 本地 / 演示入口
