@@ -1028,6 +1028,53 @@ def _grouped_corr(p, y, sidb):
     return corrs[valid].mean()
 
 
+def _soft_spread_loss(p, y, sidb, q=0.2, tau=10.0):
+    """soft top-bottom spread 损失 (组内, 可导)。
+
+    诊断结论: 当前 soft-IC 损失对"头部/尾部选股"不敏感, 导致多空 Sharpe 落后
+    (实际 spread 只有完美排序的 ~9%)。本损失直接优化多空组合两端:
+
+        spread = 多头加权收益 - 空头加权收益
+                = Σ w_long·y - Σ w_short·y
+
+      w_long  = softmax(p·tau)      (预测分高 -> 多头权重大)
+      w_short = softmax(-p·tau)     (预测分低 -> 空头权重大)
+
+    返回 loss = -mean(spread), 即鼓励"高分的真收益高、低分的真收益低"。
+    温度 tau 控制软硬程度 (tau→∞ 退化为硬 top/bottom)。
+
+    组内计算 (按 sidb 分组), 避免随机 batch 混截面造成偏差。
+    """
+    p = p.float(); y = y.float()
+    if sidb is None:
+        sidb = torch.zeros(p.shape[0], dtype=torch.long, device=p.device)
+    ids = torch.unique(sidb)
+    gid = torch.searchsorted(ids, sidb)
+    G = ids.numel()
+
+    wl = torch.softmax(p * tau, dim=0)   # 全局 softmax 初值 (将被组内掩码替代)
+    ws = torch.softmax(-p * tau, dim=0)
+
+    # 组内归一化: 把每个 group 的 softmax 权重在组内重新归一化
+    # (softmax 可分性: 组内 softmax = 全局 softmax / 组内 sum)
+    wl_sum = torch.zeros(G, device=p.device, dtype=p.dtype)
+    ws_sum = torch.zeros(G, device=p.device, dtype=p.dtype)
+    wl_sum.scatter_add_(0, gid, wl)
+    ws_sum.scatter_add_(0, gid, ws)
+    wl = wl / (wl_sum[gid] + 1e-12)
+    ws = ws / (ws_sum[gid] + 1e-12)
+
+    spread = (wl * y).sum() - (ws * y).sum()
+    # 逐组算 spread 再平均 (每个组贡献相等, 避免大组主导)
+    sp_sum = torch.zeros(G, device=p.device, dtype=p.dtype)
+    sp_sum.scatter_add_(0, gid, (wl - ws) * y)
+    cnt = torch.bincount(gid, minlength=G).float()
+    valid = cnt >= 4
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=p.device, dtype=p.dtype)
+    return -sp_sum[valid].mean()
+
+
 def _section_ids(keys):
     """把 (day, minute) 映射为截面编号 [N] int (0..K-1)。
 
@@ -1213,7 +1260,8 @@ def _batch_windows(feats, anchors, row_idx, seq_lens, freqs, buf=None):
 
 def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
                  epochs=None, lr=None, batch=None, patience=None,
-                 weight_decay=None, val_months=None, lam_turnover=None):
+                 weight_decay=None, val_months=None, lam_turnover=None,
+                 lam_spread=None):
     """在给定 1 分钟表上训练多频模型, 返回 (model, stats, model_cfg)。
 
     数据侧**分月流式**构造 (见 `_accumulate`): 训练集与验证集各扫一遍自己的月份,
@@ -1265,6 +1313,8 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
     ytr = _rank_targets(tr["y"], tr["keys"])
     yva_raw = va["y"]
     vkeys = va["keys"]
+    # 原始 vwap 收益 (spread 损失用, 与多空组合真实收益同口径)
+    yraw = np.asarray(tr["y"], "float32")
 
     model_cfg = dict(arch="multi" if len(freqs) > 1 else "single",
                      freqs=list(freqs), **CFG.MODEL_CFG,
@@ -1290,17 +1340,22 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
 
     n = len(ytr)
     ytr_t = torch.from_numpy(ytr)
+    yraw_t = torch.from_numpy(yraw)
     buf = {f: np.empty((batch, int(seq_lens[f]), N_FEATURES), "float32")
            for f in freqs}
     grad_clip = float(tc.get("grad_clip", 1.0))
 
     use_xsec = bool(getattr(CFG, "USE_XSEC", False))
     use_turnover = bool(getattr(CFG, "USE_TURNOVER", False))
+    use_spread = bool(getattr(CFG, "USE_SPREAD", False))
     lam_to = (float(getattr(CFG, "LAMBDA_TURNOVER", 0.01))
               if lam_turnover is None else float(lam_turnover))
+    lam_spread = (float(getattr(CFG, "LAMBDA_SPREAD", 0.1))
+                  if lam_spread is None else float(lam_spread))
+    spread_tau = float(getattr(CFG, "SPREAD_TAU", 10.0))
 
-    # 截面编号 (训练周期仅算一次)
-    sec_ids_tr = _section_ids(tr["keys"]) if use_xsec else None
+    # 截面编号 (训练周期仅算一次): xsec 或 spread 都需要组内截面身份
+    sec_ids_tr = _section_ids(tr["keys"]) if (use_xsec or use_spread) else None
 
     # 换手"下一截面"配对 (全局下标, 仅算一次): cur -> 同 (instrument, day) 的
     # 下一采样截面。独立配对 batch: 每 epoch 采样一批 (cur, next) 对, 换手 loss
@@ -1354,6 +1409,13 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
                     loss = 1.0 - _grouped_corr(p, yb, sidb)
                 else:
                     loss = 1.0 - _corr_batch(p, yb)
+
+                # spread 损失 (方案 A): 直击多空两端选股。组内 softmax 加权,
+                # 用原始 vwap 收益 (与多空组合真实收益同口径)。
+                if use_spread:
+                    yrawb = yraw_t[idxb].to(device)
+                    spread_loss = _soft_spread_loss(p, yrawb, sidb, tau=spread_tau)
+                    loss = loss + lam_spread * spread_loss
 
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -1493,13 +1555,14 @@ def _eval_turnover(model, feats, anchors, seq_lens, freqs, keys, device,
 
 
 def train_and_save(datasources, train_months=None, freqs=None,
-                   model_path=MODEL_PATH, lam_turnover=None):
+                   model_path=MODEL_PATH, lam_turnover=None, lam_spread=None):
     """
     从零训练并保存 transformer_model.json(私榜重训亦调用本函数)。
 
     train_months: 训练月份列表; 默认 config.TRAIN_MONTHS (2020-01 .. 2023-12)。
     freqs:        参与建模的频率; 默认 config.FREQS。
     lam_turnover: 换手正则权重 (覆盖 config.LAMBDA_TURNOVER; None 用 config 值)。
+    lam_spread:   spread 损失权重 (覆盖 config.LAMBDA_SPREAD; None 用 config 值)。
 
     内存: 数据全程按月流式, 不物化滑窗矩阵; 峰值由 "一个月的 bar1m + 各频率
     特征矩阵" 决定, 远低于平台 51200MB 硬限制。
@@ -1513,6 +1576,8 @@ def train_and_save(datasources, train_months=None, freqs=None,
     # 实际生效的换手正则权重 (与 _train_freqs 内部一致, 供 payload 自描述)
     lam_to = (float(getattr(CFG, "LAMBDA_TURNOVER", 0.01))
               if lam_turnover is None else float(lam_turnover))
+    lam_sp = (float(getattr(CFG, "LAMBDA_SPREAD", 0.1))
+              if lam_spread is None else float(lam_spread))
 
     table = datasources["bar1m"]
     print(f"[train] 分月流式读取 {len(train_months)} 个月 bar1m ... seed={SEED}")
@@ -1521,7 +1586,7 @@ def train_and_save(datasources, train_months=None, freqs=None,
     seq_lens = {f: max(1, CFG.LOOKBACK_MINUTES // FREQ_MINUTES[f]) for f in freqs}
     model, stats, model_cfg = _train_freqs(
         table, train_months, list(freqs), seq_lens, ALIGNED_MINUTES, seed=SEED,
-        lam_turnover=lam_turnover)
+        lam_turnover=lam_turnover, lam_spread=lam_sp)
 
     payload = {
         "format": "miniquant-transformer-v1",
@@ -1539,6 +1604,9 @@ def train_and_save(datasources, train_months=None, freqs=None,
         "use_xsec": bool(getattr(CFG, "USE_XSEC", False)),
         "use_turnover": bool(getattr(CFG, "USE_TURNOVER", False)),
         "lambda_turnover": lam_to,
+        "use_spread": bool(getattr(CFG, "USE_SPREAD", False)),
+        "lambda_spread": lam_sp,
+        "spread_tau": float(getattr(CFG, "SPREAD_TAU", 10.0)),
         "label_direction": "end_over_vwap",  # label = end_price/vwap - 1 (新方向, 不取负)
         "lookback_minutes": int(CFG.LOOKBACK_MINUTES),
         "horizon_minutes": int(CFG.HORIZON_MINUTES),
