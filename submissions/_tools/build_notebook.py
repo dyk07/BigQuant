@@ -29,6 +29,7 @@ PACKAGES = [
     "cnn_3f_1020_swa",
     "cnn_3f_1021_spread",
     "cnn_3f_1021_turnover_v3",
+    "cnn_3f_1022_turnover_spread",
 ]
 NOTEBOOK_NAME = "Transformer_modelsave_predict.ipynb"
 
