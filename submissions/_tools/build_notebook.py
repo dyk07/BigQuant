@@ -28,6 +28,7 @@ PACKAGES = [
     "cnn_3f_1020_newlabel_to0005",
     "cnn_3f_1020_swa",
     "cnn_3f_1021_spread",
+    "cnn_3f_1021_turnover_v3",
 ]
 NOTEBOOK_NAME = "Transformer_modelsave_predict.ipynb"
 
@@ -40,7 +41,7 @@ CFG_KEYS = ["SEED", "FREQS", "LOOKBACK_MINUTES", "HORIZON_MINUTES",
             "USE_AMP", "AMP_DTYPE",
             "USE_SWA", "SWA_START_EPOCH",
             "USE_SPREAD", "LAMBDA_SPREAD", "SPREAD_TAU",
-            "USE_RANK_DRIFT"]
+            "USE_RANK_DRIFT", "TO_STEP_INTERVAL"]
 
 DRIVER = '''# ============================================================
 # 本地 / 演示入口

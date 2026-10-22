@@ -1362,6 +1362,29 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
         del nxt_all, valid
     n_pair = len(cur_tr) if cur_tr is not None else 0
 
+    # 换手正则频率: 每 TO_STEP_INTERVAL 个主 batch 做一次换手 step。
+    # 默认 1 = 每个 batch 都做 (与主损失频率完全对齐)。
+    to_interval = int(getattr(CFG, "TO_STEP_INTERVAL", 1))
+
+    def _sample_turnover():
+        """采样一批换手配对 (按截面, 保证组内 rank 有意义)。"""
+        secs, sec_counts = np.unique(sec_cur_tr, return_counts=True)
+        target = batch // 2
+        chosen = []
+        n_taken = 0
+        perm_sec = np.random.permutation(len(secs))
+        for si in perm_sec:
+            c = sec_counts[si]
+            if n_taken + c > target and n_taken > 0:
+                break
+            chosen.append(si)
+            n_taken += c
+        if not chosen:
+            chosen = [perm_sec[0]]
+        sel = np.concatenate([np.where(sec_cur_tr == secs[c])[0]
+                              for c in chosen])
+        return (cur_tr[sel], nxt_tr[sel], sec_cur_tr[sel], sec_nxt_tr[sel])
+
     best, best_state, bad = -9e9, None, 0
 
     for ep in range(epochs):
@@ -1370,36 +1393,6 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
         perm_np = perm.numpy()
         tot = 0.0; nb = 0
         tot_to = 0.0; cnt_to = 0
-
-        # 换手独立配对 batch: 每 epoch 采样一批 (cur, next) 对作为额外的
-        # 前向 step (不更新主损失方向, 只叠加换手正则)。命中率 100%。
-        # 组内 rank 漂移需要"按截面采样": 随机选若干截面, 取每个截面的全部配对,
-        # 这样每个截面内有足够股票算 soft rank。
-        to_cur = to_nxt = None
-        sec_to_cur = sec_to_nxt = None
-        if use_turnover and n_pair >= 2:
-            # 随机选截面 (最多 ceil(batch/2/每截面平均配对) 个)
-            secs, sec_counts = np.unique(sec_cur_tr, return_counts=True)
-            target = batch // 2
-            chosen = []
-            n_taken = 0
-            # 随机打乱截面顺序, 逐个加入直到达到 batch 上限
-            perm_sec = np.random.permutation(len(secs))
-            for si in perm_sec:
-                c = sec_counts[si]
-                if n_taken + c > target and n_taken > 0:
-                    break
-                chosen.append(si)
-                n_taken += c
-            if not chosen:
-                chosen = [perm_sec[0]]
-                n_taken = sec_counts[perm_sec[0]]
-            sel = np.concatenate([np.where(sec_cur_tr == secs[c])[0]
-                                  for c in chosen])
-            to_cur = cur_tr[sel]
-            to_nxt = nxt_tr[sel]
-            sec_to_cur = sec_cur_tr[sel]
-            sec_to_nxt = sec_nxt_tr[sel]
 
         for s in range(0, n, batch):
             idxb = perm_np[s:s + batch]
@@ -1436,41 +1429,43 @@ def _train_freqs(table, train_months, freqs, seq_lens, minutes, seed=SEED,
                 opt.step()
             tot += float(loss); nb += 1
 
-        # ---- 换手独立配对 step (100% 命中) ----
-        # 采样一批 (cur, next) 配对做一次额外前向, 叠加 λ·(1 - corr(p_cur, p_next))。
-        # 独立于主 batch, 不扰动主损失方向。
-        if use_turnover and to_cur is not None and to_nxt is not None:
-            xc = _batch_windows(tr["feats"], tr["anchors"], to_cur, seq_lens,
-                                freqs, buf=None)
-            xn = _batch_windows(tr["feats"], tr["anchors"], to_nxt, seq_lens,
-                                freqs, buf=None)
-            xcb = [torch.from_numpy(x).to(device) for x in xc]
-            xnb = [torch.from_numpy(x).to(device) for x in xn]
-            opt.zero_grad()
-            with torch.autocast(device_type="cuda", dtype=amp_dtype,
-                                enabled=use_amp):
-                pc = model(xcb, sec_ids=None)
-                pn = model(xnb, sec_ids=None)
-                to_corr = _corr_batch(pc, pn)
-                if use_rank_drift:
-                    to_form_loss = _grouped_rank_drift(
-                        pc, pn,
-                        torch.from_numpy(sec_to_cur).to(device),
-                        torch.from_numpy(sec_to_nxt).to(device))
+            # ---- 换手正则 step: 每个 batch 后 (或每 to_interval 个 batch) ----
+            # 关键修复: 原实现每 epoch 只做 1 次换手 step, 频率是主损失的 1/158,
+            # 导致换手梯度被主损失完全淹没。现在内联到 batch 循环, 频率对齐。
+            if (use_turnover and n_pair >= 2
+                    and (nb % to_interval == 0)):
+                to_cur, to_nxt, sec_to_cur, sec_to_nxt = _sample_turnover()
+                xc = _batch_windows(tr["feats"], tr["anchors"], to_cur,
+                                    seq_lens, freqs, buf=None)
+                xn = _batch_windows(tr["feats"], tr["anchors"], to_nxt,
+                                    seq_lens, freqs, buf=None)
+                xcb = [torch.from_numpy(x).to(device) for x in xc]
+                xnb = [torch.from_numpy(x).to(device) for x in xn]
+                opt.zero_grad()
+                with torch.autocast(device_type="cuda", dtype=amp_dtype,
+                                    enabled=use_amp):
+                    pc = model(xcb, sec_ids=None)
+                    pn = model(xnb, sec_ids=None)
+                    to_corr = _corr_batch(pc, pn)
+                    if use_rank_drift:
+                        to_form_loss = _grouped_rank_drift(
+                            pc, pn,
+                            torch.from_numpy(sec_to_cur).to(device),
+                            torch.from_numpy(sec_to_nxt).to(device))
+                    else:
+                        to_form_loss = 1.0 - to_corr
+                    to_loss = lam_to * to_form_loss
+                if scaler is not None:
+                    scaler.scale(to_loss).backward()
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(opt)
+                    scaler.update()
                 else:
-                    to_form_loss = 1.0 - to_corr
-                to_loss = lam_to * to_form_loss
-            if scaler is not None:
-                scaler.scale(to_loss).backward()
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(opt)
-                scaler.update()
-            else:
-                to_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                opt.step()
-            tot_to += float(to_form_loss.detach()); cnt_to += 1
+                    to_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    opt.step()
+                tot_to += float(to_form_loss.detach()); cnt_to += 1
 
         ic = _eval_ic(model, va["feats"], va["anchors"], seq_lens,
                       yva_raw, vkeys, freqs, device)
@@ -1616,6 +1611,7 @@ def train_and_save(datasources, train_months=None, freqs=None,
         "use_turnover": bool(getattr(CFG, "USE_TURNOVER", False)),
         "lambda_turnover": lam_to,
         "use_rank_drift": bool(getattr(CFG, "USE_RANK_DRIFT", False)),
+        "to_step_interval": int(getattr(CFG, "TO_STEP_INTERVAL", 1)),
         "label_direction": "end_over_vwap",  # label = end_price/vwap - 1 (新方向, 不取负)
         "lookback_minutes": int(CFG.LOOKBACK_MINUTES),
         "horizon_minutes": int(CFG.HORIZON_MINUTES),

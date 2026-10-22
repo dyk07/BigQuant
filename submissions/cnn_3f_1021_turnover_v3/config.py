@@ -79,10 +79,14 @@ XSEC_HEADS = 4            # 交叉注意力头数
 # ----------------------------------------------------------------------
 # 评分标准中换手率占 20% (换手越低排名越高)。这里惩罚同一只股票在
 # 相邻可用截面 (同一交易日、按 SAMPLE_STEP_MINUTES 网格的下一截面) 的
-# 预测分数变化: loss = 1 - corr(p_t, p_{t+1})。分数跨截面相关越高,
-# 相对排序越稳定、调仓成本越低。该相关形同主损失 (soft-IC) 的量纲,
-# 因此权重无需按分数尺度校准。
+# 预测分数变化: loss = 1 - corr(p_t, p_{t+1})。
+#
+# 关键修复 (2026-10-22): 换手 step 原为"每 epoch 1 次", 频率是主损失
+# (每 epoch 158 次) 的 1/158, 梯度被完全淹没 -> 换手正则从未生效。
+# 现已内联到 batch 循环 (TO_STEP_INTERVAL=1), 频率对齐后 λ 重扫:
+#   λ=0.1 为最优 (val_IC=0.1003 + val_turnover=0.08~0.14, 双赢)。
 # ======================================================================
 USE_TURNOVER = True       # 是否启用换手正则
-LAMBDA_TURNOVER = 0.005   # 换手正则权重 (λ 扫描最优: 相对 corr 主损失; loss = 1 - corr)
-USE_RANK_DRIFT = True     # 换手 loss 形式: True=组内 rank 漂移(直击平台口径); False=全局 corr
+LAMBDA_TURNOVER = 0.1     # 换手正则权重 (频率对齐后重扫最优: 0.1)
+USE_RANK_DRIFT = False    # 换手 loss 形式: False=全局 corr (扫描确认 corr 优于 rank drift)
+TO_STEP_INTERVAL = 1      # 换手 step 频率: 每 N 个主 batch 做 1 次换手 step (1=每个 batch)
