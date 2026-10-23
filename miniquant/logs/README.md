@@ -36,6 +36,8 @@ logs/
 | v7 | 2026-10-18 | AMP 混合精度 + 训练效率优化 | [2026-10-18_amp_efficiency.md](./2026-10-18_amp_efficiency.md) | 0.0767（96.6min，5.3×提速） |
 | v8 | 2026-10-19 | hidden 加宽 A/B（64→96） | [2026-10-19_hidden_width.md](./2026-10-19_hidden_width.md) | 0.0713（负贡献，已回滚） |
 | v9 | 2026-10-19 | 公榜回退诊断 + 提交历史归档 | [2026-10-19_regression_diagnosis.md](./2026-10-19_regression_diagnosis.md) | 高分 0.0886 对应干净基线 |
+| v10 | 2026-10-23 | 推理端 L1 软阈值降换手（L1 优于 EMA 的 L2） | [2026-10-23_l1_soft_threshold_beats_ema.md](./2026-10-23_l1_soft_threshold_beats_ema.md) | 等换手下 IC_IR 损失减半 |
+| v11 | 2026-10-24 | **自有模型 + 团队高分模型推理端融合** | [2026-10-24_fuse_highscore.md](./2026-10-24_fuse_highscore.md) | **0.1310**（+14.0%，相关仅 0.50） |
 | — | 持续更新 | 平台公榜成绩记录 | [leaderboard.md](./leaderboard.md) | 每次 submission 追加一行 |
 
 > 说明：各版本验证集口径不完全一致（采样截面数 / 样本数随配置演进有变化），

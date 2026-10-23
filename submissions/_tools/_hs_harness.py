@@ -15,7 +15,8 @@ import types
 import numpy as np
 import pandas as pd
 
-ROOT = os.path.abspath(".")
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", ".."))
 DATA = {
     "bar30m": os.path.join(ROOT, "e2e_data", "cpt_jyc_2026_e2e_bar30m"),
     "bar5m": os.path.join(ROOT, "e2e_data", "cpt_jyc_2026_e2e_bar5m"),
