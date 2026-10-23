@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# highscore ?????? (????, ???)
+_preds_*.parquet
+submissions/_tools/_preds_*.npz
