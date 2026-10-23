@@ -30,6 +30,7 @@ PACKAGES = [
     "cnn_3f_1021_spread",
     "cnn_3f_1021_turnover_v3",
     "cnn_3f_1022_turnover_spread",
+    "cnn_3f_1023_ema_post",
 ]
 NOTEBOOK_NAME = "Transformer_modelsave_predict.ipynb"
 
@@ -42,7 +43,7 @@ CFG_KEYS = ["SEED", "FREQS", "LOOKBACK_MINUTES", "HORIZON_MINUTES",
             "USE_AMP", "AMP_DTYPE",
             "USE_SWA", "SWA_START_EPOCH",
             "USE_SPREAD", "LAMBDA_SPREAD", "SPREAD_TAU",
-            "USE_RANK_DRIFT", "TO_STEP_INTERVAL"]
+            "USE_RANK_DRIFT", "TO_STEP_INTERVAL", "EMA_ALPHA"]
 
 DRIVER = '''# ============================================================
 # 本地 / 演示入口
@@ -121,13 +122,23 @@ def split_train(src):
 
 
 def extract_main(predict_py):
-    """抽取推理入口 main(), 去掉跨文件 import 并补上平台依赖导入。"""
+    """抽取推理入口 main() 及其依赖的模块级辅助函数, 去掉跨文件 import。
+
+    起点取脚本中**第一个模块级 def**, 这样定义在 main 之前的推理辅助函数
+    (如 `_ema_within_day`) 会一并纳入, 避免 notebook 出现未定义符号。
+    """
     src = open(predict_py, encoding="utf-8").read()
     src = re.sub(r'from Transformer_modelsave_train import \([\s\S]*?\)\n', '', src)
-    m = re.search(r'\ndef main\(', src)
+    m = re.search(r'^def ', src, flags=re.M)
+    if m is None:
+        m = re.search(r'\ndef main\(', src)
     body = src[m.start():]
     body = re.split(r'\nif __name__ == "__main__":', body)[0]
-    return PLATFORM_IMPORTS + body
+    head = PLATFORM_IMPORTS
+    # 后处理系数(若脚本引用)从 CFG 读取, 保持配置单一事实来源
+    if "EMA_ALPHA" in body:
+        head += "\nEMA_ALPHA = CFG.EMA_ALPHA\n"
+    return head + "\n" + body
 
 
 def build_notebook(pkg_dir, title_note):
