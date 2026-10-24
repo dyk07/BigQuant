@@ -9,7 +9,10 @@
 指标口径与 _cross_fuse_test.py 完全一致 (复用其 build_labels / metrics),
 避免自造的 label 定义引入系统性偏差。
 
-用法: python _verify_fuse_e2e.py [start] [end]
+用法: python _verify_fuse_e2e.py [包名] [start] [end] [--bar1m-only]
+
+  --bar1m-only  只给 bar1m、不给 bar30m/bar5m, 用于验证高分模型段的重采样降级
+                路径 (平台若未注入 bar30m/bar5m 时的兜底分支)。
 """
 import json
 import os
@@ -25,7 +28,8 @@ from _hs_harness import install_fake_dai  # noqa: E402
 from _cross_fuse_test import build_labels, metrics  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-PKG = os.path.join(ROOT, "submissions", "cnn_3f_1024_fuse_hs")
+PKG_NAME = "cnn_3f_1024_fuse_raw"
+PKG = os.path.join(ROOT, "submissions", PKG_NAME)
 NB = os.path.join(PKG, "Transformer_modelsave_predict.ipynb")
 
 
@@ -85,21 +89,33 @@ def show(tag, r):
 
 
 def main():
-    start = sys.argv[1] if len(sys.argv) > 1 else "2024-11-01"
-    end = sys.argv[2] if len(sys.argv) > 2 else "2024-11-29"
+    global PKG, NB
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if args and not args[0][:2].isdigit():
+        PKG = os.path.join(ROOT, "submissions", args.pop(0))
+        NB = os.path.join(PKG, "Transformer_modelsave_predict.ipynb")
+    start = args[0] if len(args) > 0 else "2024-11-01"
+    end = args[1] if len(args) > 1 else "2024-11-29"
+    bar1m_only = "--bar1m-only" in flags
+    tag = PKG.split(os.sep)[-1] + ("_b1" if bar1m_only else "")
     install_fake_dai()
     install_stub_structlog()
 
+    print(f"[verify] 包={PKG}")
     print("[verify] 执行 notebook 全部 cell ...")
     ns = run_notebook()
 
-    print(f"[verify] 调用 main({start} ~ {end}) ...")
-    ds = {"bar1m": "bar1m", "bar5m": "bar5m", "bar30m": "bar30m"}
-    cache = os.path.join(HERE, f"_preds_fuse_{start}_{end}.npz")
+    print(f"[verify] 调用 main({start} ~ {end}), bar1m_only={bar1m_only} ...")
+    # 平台注入的 datasources 值是**表名字符串**。--bar1m-only 用来验证
+    # 「平台只给 bar1m」这一历史已证实的接口边界下, 高分模型段的降级路径。
+    ds = {"bar1m": "bar1m"}
+    if not bar1m_only:
+        ds.update({"bar5m": "bar5m", "bar30m": "bar30m"})
 
     def cached(name, fn):
         """推理很慢; 缓存各路段预测, 便于反复调试指标口径。"""
-        p = os.path.join(HERE, f"_preds_fuse_{name}_{start}_{end}.parquet")
+        p = os.path.join(HERE, f"_preds_fuse_{tag}_{name}_{start}_{end}.parquet")
         if os.path.exists(p):
             df = pd.read_parquet(p)
             df["date"] = pd.to_datetime(df["date"])
@@ -110,7 +126,6 @@ def main():
         return df
 
     out = cached("main", lambda: ns["main"](ds, start, end))
-    del cache
     print(f"  输出: {len(out)} 行, 列={list(out.columns)}, "
           f"日期={out['date'].nunique()}, 标的={out['instrument'].nunique()}")
     assert list(out.columns) == ["date", "instrument", "factor"], "输出列不符"

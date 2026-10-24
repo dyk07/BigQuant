@@ -13,7 +13,8 @@ sys.path.insert(0, HERE)
 from _hs_harness import install_fake_dai  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-PKG = os.path.join(ROOT, "submissions", "cnn_3f_1024_fuse_hs")
+PKG = os.path.join(ROOT, "submissions",
+                   sys.argv[1] if len(sys.argv) > 1 else "cnn_3f_1024_fuse_raw")
 
 
 def main():

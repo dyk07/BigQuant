@@ -1545,9 +1545,9 @@ def train_and_save(datasources, train_months=None, freqs=None,
         "sort_key": 1,           # resample/make_anchors 已按时间排序
         "state_dict": {k: v for k, v in model.state_dict().items()},
     }
-    # 融合包: hs_* 高分模型权重是团队预训练的固定件, 本函数只重训自有模型。
+    # 融合包: hs_* 是团队预训练的固定件, 本函数只重训自有模型。
     # save_model 会整文件覆盖, 故先取出旧文件里的 hs_* 键, 保存后原样写回,
-    # 否则私榜重训会把它们冲掉, main() 随后会抛"融合权重缺少模型键"。
+    # 否则私榜重训会冲掉它们, main() 随后抛"融合权重缺少模型键"。
     hs_kept = {}
     if os.path.exists(model_path):
         try:
@@ -1563,8 +1563,7 @@ def train_and_save(datasources, train_months=None, freqs=None,
         fresh.update(hs_kept)
         with open(model_path, "w", encoding="utf-8") as fh:
             json.dump(fresh, fh)
-        print(f"[train] 已保留高分模型权重键 {sorted(hs_kept)} "
-              f"({os.path.getsize(model_path)/1e6:.2f} MB)")
+        print(f"[train] 已保留高分模型权重键 {sorted(hs_kept)}")
     print(f"[train] 已保存 {model_path} ({os.path.getsize(model_path)/1e6:.2f} MB)")
     return model_path
 
